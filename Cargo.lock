@@ -6465,7 +6465,7 @@ dependencies = [
 
 [[package]]
 name = "osy-forge"
-version = "0.2.2"
+version = "0.3.1"
 dependencies = [
  "anylm",
  "atoman 0.14.2",

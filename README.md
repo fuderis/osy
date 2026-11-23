@@ -44,7 +44,9 @@ Unlike traditional agentic frameworks that suffer from uncontrolled agent autono
 
 ## Official Extensions
 
-- **[osy-system](https://github.com/fuderis/osy-system.git): Local system management agent** — Provides system metrics, appearance changing, power & media control, disks & infrastructure management.
+- **[osy-system](https://github.com/fuderis/osy-system.git): System management agent** — Provides system metrics, appearance changing, power & media control, disks & infrastructure management.
+- **[osy-forge](https://github.com/fuderis/osy-forge.git): Developer agent** — Provides tools for write applications and working with Git.
+- **[osy-home](https://github.com/fuderis/osy-home.git): Smart home agent** — Based on `Arduino Pro Micro` board: IR Receiver, 4 Relays, 4 Servo, 2 Motors.
 
 ---
 
