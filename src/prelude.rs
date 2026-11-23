@@ -7,7 +7,6 @@ pub use osy_share::{Id, SessionId};
 // Basic primitives
 pub use atoman::{
     DynError, Result, StdResult,
-    file::{Dir, File},
     logger::{LogExt, Logger, Span, error, info, log, warn},
     shared::{SharedGuard, SharedGuardMut, SharedItem, SharedMap},
     state::{State, StateGuard},

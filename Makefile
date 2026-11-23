@@ -6,6 +6,9 @@ INSTALL_DIR ?= /usr/local/bin
 
 .PHONY: stop build install install-agents install-agent install-all prepare
 
+AGENT_ARG := $(word 2,$(MAKECMDGOALS))
+AGENT_NAME := $(if $(name),$(name),$(if $(filter-out install-agent,$(AGENT_ARG)),$(AGENT_ARG),))
+
 # 0. Helper: creates agents/ dir and copies /crates/agent as a stub to satisfy workspace glob
 prepare:
 	@mkdir -p agents
@@ -75,31 +78,32 @@ install: stop build
 
 # 5. Installing agent by name
 install-agent: prepare
-	@if [[ -z "$(name)" ]]; then \
-		echo "  ✗ Error: Agent name is required. Use: make install-agent name=<agent_name>" >&2; \
+	@if [[ -z "$(AGENT_NAME)" ]]; then \
+		echo "  ✗ Error: Agent name is required. Use: make install-agent <agent_name>" >&2; \
 		exit 1; \
 	fi; \
-	if [[ ! -d "agents/$(name)" ]]; then \
-		echo "  ✗ Agent directory agents/$(name) not found" >&2; \
+	if [[ ! -d "agents/$(AGENT_NAME)" ]]; then \
+		echo "  ✗ Agent directory agents/$(AGENT_NAME) not found" >&2; \
 		exit 1; \
 	fi; \
 	if [[ -w "$(INSTALL_DIR)" ]]; then \
 		INSTALL_CMD="install"; \
 	else \
+		echo "  ℹ No write access to $(INSTALL_DIR), using sudo"; \
 		INSTALL_CMD="sudo install"; \
 	fi; \
-	printf "\n\033[1mBuilding agent: $(name)\033[0m\n"; \
-	cargo build --release --manifest-path agents/$(name)/Cargo.toml; \
-	METADATA="$$(cargo metadata --format-version=1 --no-deps --manifest-path agents/$(name)/Cargo.toml)"; \
+	printf "\n\033[1mBuilding agent: $(AGENT_NAME)\033[0m\n"; \
+	cargo build --release --manifest-path agents/$(AGENT_NAME)/Cargo.toml; \
+	METADATA="$$(cargo metadata --format-version=1 --no-deps --manifest-path agents/$(AGENT_NAME)/Cargo.toml)"; \
 	PACKAGE_NAME=$$(jq -r '.workspace_members[]' <<< "$$METADATA" | while read -r id; do \
 		pkg_dir=$$(jq -r --arg id "$$id" '.packages[] | select(.id == $$id) | .manifest_path' <<< "$$METADATA" | xargs dirname); \
-		if [[ "$$pkg_dir" == *"agents/$(name)" ]]; then \
+		if [[ "$$pkg_dir" == *"agents/$(AGENT_NAME)" ]]; then \
 			jq -r --arg id "$$id" '.packages[] | select(.id == $$id) | .name' <<< "$$METADATA"; \
 			break; \
 		fi; \
 	done); \
 	if [[ -z "$$PACKAGE_NAME" ]]; then \
-		PACKAGE_NAME="$(name)"; \
+		PACKAGE_NAME="$(AGENT_NAME)"; \
 	fi; \
 	BINARIES=$$(jq -r --arg pkg "$$PACKAGE_NAME" '.packages[] | select(.name == $$pkg) | .targets[] | select(.kind | any(. == "bin")) | .name' <<< "$$METADATA"); \
 	for bin in $$BINARIES; do \
@@ -112,7 +116,7 @@ install-agent: prepare
 			exit 1; \
 		fi; \
 	done; \
-	printf "\033[32m✓\033[0m Agent $(name) updated successfully\n"
+	printf "\033[32m✓\033[0m Agent $(AGENT_NAME) updated successfully\n"
 
 # 6. Installing all agents
 install-agents: prepare
@@ -135,3 +139,8 @@ install-agents: prepare
 
 # 7. Installing kernel & all agents
 install-all: install install-agents
+
+ifneq ($(AGENT_NAME),)
+$(AGENT_NAME):
+	@:
+endif

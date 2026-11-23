@@ -1,8 +1,8 @@
 use crate::prelude::*;
 
-use atoman::trace::{FilterEngine, MultiTrace, SourceConfig};
-use regex::Regex;
+use atoman::trace::{Filters, Source, Trace};
 use rigging::widgets::Print;
+use std::future::pending;
 
 /// Server status.
 #[derive(Deserialize)]
@@ -53,49 +53,42 @@ pub async fn handle_trace(uid_filter: Option<u64>, only_new: bool) -> Result<()>
         .file_name()
         .map(|s| str!(s.to_string_lossy()))
         .unwrap_or("osy".into());
-    sources.push(SourceConfig {
-        name: kernel_name.clone(),
-        dir_path: path!("$state/{kernel_name}/logs"),
-        entry_start_pattern: Regex::new(r"\b\d{4}-\d{2}-\d{2}").unwrap(),
-        color_code: 35,
-    });
+    sources.push(Source::new(
+        kernel_name.clone(),
+        path!("$state/{kernel_name}/logs"),
+        true,
+        only_new,
+    ));
 
     // dynamic agent sources
     for agent in agents {
         let agent_name = format!("{kernel_name}-{}", agent.name);
         let agent_dir = path!("$state/{agent_name}/logs");
-        sources.push(SourceConfig {
-            name: agent_name,
-            dir_path: agent_dir,
-            entry_start_pattern: Regex::new(r"\b\d{4}-\d{2}-\d{2}").unwrap(),
-            color_code: 36,
-        });
+        sources.push(Source::new(agent_name, agent_dir, true, only_new));
     }
 
-    // configure log entry filtering by UID or SID
-    let mut regex_patterns = Vec::new();
-
-    if let Some(uid) = uid_filter {
-        let uid_sid_pattern = format!(r"(uid[=:\s]+{0}\b|(?:\b|/){0}-\d+-\d+)", uid);
-        regex_patterns.push(uid_sid_pattern);
-
+    // configure log entry filtering by UID parameter
+    let uid_str;
+    let kv_pairs: Vec<(&str, &str)> = if let Some(uid) = uid_filter {
+        uid_str = uid.to_string();
         Print::info(format!("Filtering logs by User ID: {uid}"))
             .render()
             .await?;
-    }
+        vec![("uid", uid_str.as_str())]
+    } else {
+        vec![]
+    };
 
-    let raw_regex_refs: Vec<&str> = regex_patterns.iter().map(|s| s.as_str()).collect();
-    let filter_engine = FilterEngine::new(&raw_regex_refs, &[]);
+    let filters = Filters::new(&[], &kv_pairs);
 
     // start multi-source log tracing
-    let mut tracer =
-        MultiTrace::start(sources, Duration::from_millis(200), filter_engine, only_new).await;
+    let _tracer = Trace::trace(sources, Duration::from_millis(200), filters).await;
 
     Print::info("Log tracer started. Waiting for events...")
         .render()
         .await?;
 
-    loop {
-        tracer.recv_and_print().await;
-    }
+    pending::<()>().await;
+
+    Ok(())
 }

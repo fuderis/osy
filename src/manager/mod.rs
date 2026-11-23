@@ -6,7 +6,7 @@ pub use agent::Agent;
 use crate::{prelude::*, skills};
 
 use anylm::api::Tool;
-use atoman::task::JoinSet;
+use atoman::{fs, task::JoinSet};
 use osy_share::AgentMeta;
 use std::fmt::Write;
 
@@ -33,19 +33,19 @@ impl Manager {
         let scan_dir = path!("$/");
 
         // check scan dir
-        if !scan_dir.exists() {
+        if !fs::try_exists(&scan_dir).await? {
             warn!("[Manager] Core directory not found at: {scan_dir:?}.");
             return Ok(());
         }
 
         let mut set = JoinSet::new();
-        let mut reader = Dir::read(scan_dir).await?;
+        let mut reader = fs::read_dir(&scan_dir).await?;
 
         info!("[Manager] Scanning for agent binaries...");
 
         // read files in core dir
-        while let Some(entry) = reader.next_file().await? {
-            let path = entry.path().clone();
+        while let Some(entry) = reader.next_entry().await? {
+            let path = entry.path();
             let file_name = path
                 .file_name()
                 .unwrap_or_default()

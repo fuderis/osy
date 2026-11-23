@@ -13,21 +13,47 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
+[package]
+name = "osy"
+description = "AI-Powered Toolkit Kernel (Experimental)."
+version = "0.26.0"
+edition = "2024"
+
+[dependencies]
+osy-share.workspace = true
+atoman.workspace = true
+macron.workspace = true
+rigging.workspace = true
+pearce.workspace = true
+anylm.workspace = true
+cistern.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+boa_engine.workspace = true
+libc.workspace = true
+rand.workspace = true
+regex.workspace = true
+whatlang.workspace = true
+sysinfo.workspace = true
+heck.workspace = true
+include_dir.workspace = true
+
 [workspace]
-members = ["crates/kernel", "crates/share", "crates/skill", "agents/*"]
-default-members = ["crates/kernel"]
+members = ["crates/share", "crates/skill", "agents/*"]
+default-members = ["./"]
 resolver = "3"
 
 [workspace.dependencies]
 osy-share.path = "crates/share"
 osy-skill.path = "crates/skill"
 
-atoman = { version = "0.12.2", features = ["full"] }
-macron = { version = "0.5.2", features = ["full"] }
-rigging = { version = "0.5.13", features = ["full"] }
-pearce = { version = "0.7.0", features = ["full"] }
-anylm = { version = "0.4.2", features = ["full"] }
-cistern = { version = "0.4.0", features = ["full"] }
+atoman = { version = "0.14.2", features = ["full"] }
+macron = { version = "0.8.0", features = ["full"] }
+rigging = { version = "0.6.0", features = ["full"] }
+pearce = { version = "0.9.0", features = ["full"] }
+anylm = { version = "0.6.0", features = ["full"] }
+cistern = { version = "0.5.0", features = ["full"] }
 
 # atoman = { path = "../../crates/atoman", features = ["full"] }
 # rigging = { path = "../../crates/rigging", features = ["full"] }

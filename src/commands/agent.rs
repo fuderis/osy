@@ -7,7 +7,7 @@ use osy_share::StatusData;
 use rigging::{Stylize, widgets::Print};
 
 // Agent template files.
-static AGENT_TEMPLATE: Dir = include_dir!("$CARGO_MANIFEST_DIR/../agent");
+static AGENT_TEMPLATE: Dir = include_dir!("$CARGO_MANIFEST_DIR/crates/agent");
 
 /// API: Handles agent list command.
 pub async fn handle_agent_list() -> Result<()> {

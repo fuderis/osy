@@ -114,7 +114,7 @@ impl UserState {
     /// Loads user's metadata from database.
     pub async fn load_metadata(&self) -> Result<Option<UserMetadata>> {
         let table = self.kv_db.open_table("global").await?;
-        table.read("user_metadata").await
+        table.read("user_metadata").await.map_err(Into::into)
     }
 
     /// Retains user's metadata into database.

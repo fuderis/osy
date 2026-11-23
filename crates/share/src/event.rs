@@ -64,10 +64,12 @@ impl Dialog {
         let mut callback = Callback::register(&id).await;
         tx.send(Event::Dialog(self))?;
 
+        use atoman::error::Error;
+
         let output = atoman::select! {
-            _ = tx.closed() => return Err(atoman::error::Error::ChannelClosed.into()),
+            _ = tx.closed() => return Err(Error::from(atoman::channel::ChannelError::ChannelClosed).into()),
             res = callback.recv::<T>(timeout) => {
-                res.map_err(|e| atoman::error::Error::Custom(format!("Dialog action failed: {e}")))?
+                res.map_err(|e| Error::Custom(format!("Dialog action failed: {e}")))?
             }
         };
 
@@ -78,14 +80,29 @@ impl Dialog {
     pub async fn script(
         tx: &Sender<Bytes>,
         code: impl Into<String>,
-        use_sudo: bool,
         timeout: Duration,
     ) -> Result<Option<CommandResult>> {
         let id = Id::new().to_string();
         let dialog = Self::Script {
             id,
             code: code.into(),
-            use_sudo,
+            use_sudo: false,
+        };
+
+        dialog.dispatch(tx, timeout).await
+    }
+
+    /// Sends script for execution in CLI (with CommandResult waiting).
+    pub async fn sudo_script(
+        tx: &Sender<Bytes>,
+        code: impl Into<String>,
+        timeout: Duration,
+    ) -> Result<Option<CommandResult>> {
+        let id = Id::new().to_string();
+        let dialog = Self::Script {
+            id,
+            code: code.into(),
+            use_sudo: true,
         };
 
         dialog.dispatch(tx, timeout).await
@@ -108,13 +125,12 @@ impl Dialog {
         dialog.dispatch(tx, timeout).await
     }
 
-    /// Sends text input prompt.
+    /// Sends input prompt.
     pub async fn prompt(
         tx: &Sender<Bytes>,
         prompt: impl Into<String>,
         placeholder: Option<String>,
         default: Option<String>,
-        multiline: Option<bool>,
         timeout: Duration,
     ) -> Result<Option<String>> {
         let id = Id::new().to_string();
@@ -123,13 +139,33 @@ impl Dialog {
             prompt: prompt.into(),
             placeholder,
             default,
-            multiline,
+            multiline: Some(false),
         };
 
         dialog.dispatch(tx, timeout).await
     }
 
-    /// Sends text input prompt of secret data (passwords, tokens).
+    /// Sends multiline input prompt.
+    pub async fn multiline_prompt(
+        tx: &Sender<Bytes>,
+        prompt: impl Into<String>,
+        placeholder: Option<String>,
+        default: Option<String>,
+        timeout: Duration,
+    ) -> Result<Option<String>> {
+        let id = Id::new().to_string();
+        let dialog = Self::Prompt {
+            id,
+            prompt: prompt.into(),
+            placeholder,
+            default,
+            multiline: Some(true),
+        };
+
+        dialog.dispatch(tx, timeout).await
+    }
+
+    /// Sends secret input prompt (passwords, tokens, etc.).
     pub async fn secret(
         tx: &Sender<Bytes>,
         prompt: impl Into<String>,

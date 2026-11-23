@@ -182,18 +182,18 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "anylm"
-version = "0.4.2"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d4929ea9d85cf6795c1878e38c2c0a669d2e99831ffe05f247b99da1025904a"
+checksum = "33e0f07b0fb27965098d5b138fdae50aa4f211917128ff8962f637865ff63097"
 dependencies = [
  "anylm-schema",
- "atoman 0.12.2",
+ "atoman 0.14.2",
  "base64 0.22.1",
  "bytes",
  "chrono",
  "futures",
- "macron 0.5.2",
- "pearce 0.6.2",
+ "macron 0.7.0",
+ "pearce",
  "regex",
  "serde",
  "serde_json",
@@ -554,22 +554,6 @@ dependencies = [
 
 [[package]]
 name = "atoman"
-version = "0.2.24"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "342633935533edc5c05bbdc0fe0194051a850322c0c0390a8c8cdbfc273b7370"
-dependencies = [
- "arc-swap",
- "bytes",
- "futures",
- "macron 0.1.18",
- "once_cell",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "atoman"
 version = "0.11.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e93c3dbd203d23c34c3ed4a205f7c8b0e17ecdaa9303083f1cb01d91e6bfc9f"
@@ -584,9 +568,9 @@ dependencies = [
 
 [[package]]
 name = "atoman"
-version = "0.12.2"
+version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef85de290df75bd9b647642db8196897a4d22dfb532a1b3191c1b1fe42d9e88b"
+checksum = "a8cc213666d2f90c5ed26861d55434f2baaf81e51dfb4d1c9a6f9749fc2c48c5"
 dependencies = [
  "ahash",
  "arc-swap",
@@ -595,14 +579,13 @@ dependencies = [
  "atoman-macros",
  "bytes",
  "chrono",
- "colored",
- "fuzzy-cmp 0.1.3",
- "macron 0.5.2",
+ "macron 0.6.1",
  "once_cell",
  "regex",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "toml",
  "tracing",
  "tracing-subscriber",
@@ -610,9 +593,9 @@ dependencies = [
 
 [[package]]
 name = "atoman-config"
-version = "0.3.3"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79ae1d9234d2728d0098a749dbd5a107f9281de8f16dc05f31e929bbdf09fdc4"
+checksum = "f87cf0596a8da5df3a7efedbee671613b9b2d567f5008b8e617d572dd0e27de0"
 dependencies = [
  "heck 0.4.1",
  "proc-macro2",
@@ -1390,21 +1373,20 @@ dependencies = [
 
 [[package]]
 name = "cistern"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad41f2cb4f8b503dcd2a2833fb03b9a0b9988dd65b5518e0c43ab0a931edc410"
+checksum = "64e44c30ede5078ad005c8645196607c53614050619da5513d28cb054a6f1b62"
 dependencies = [
  "arrow-array",
  "arrow-schema",
- "atoman 0.2.24",
+ "atoman 0.14.2",
  "lancedb",
- "macron 0.1.18",
+ "macron 0.7.0",
  "rand 0.10.1",
  "serde",
  "serde_arrow",
  "serde_json",
  "sled",
- "tokio",
 ]
 
 [[package]]
@@ -1442,15 +1424,6 @@ dependencies = [
  "serde",
  "termcolor",
  "unicode-width",
-]
-
-[[package]]
-name = "colored"
-version = "3.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
-dependencies = [
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3405,16 +3378,6 @@ dependencies = [
 
 [[package]]
 name = "fuzzy-cmp"
-version = "0.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a354c3170e5fd8f552a0dbfa5a9b7b431b2fbcd552a6f9253f02cd34be9435f"
-dependencies = [
- "distance",
- "macron 0.1.18",
-]
-
-[[package]]
-name = "fuzzy-cmp"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3fa8863503406835198342f26f68795818c76318e9a6d616a09b0beef7a5061d"
@@ -5246,24 +5209,6 @@ checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
 name = "macron"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03d86f99fc455fb28c1d1195e9fee1c4268ad426d3b3adb278e28fad5dba1919"
-dependencies = [
- "macron-collections",
- "macron-impl-display 0.1.1",
- "macron-impl-error",
- "macron-impl-from 0.1.1",
- "macron-impl-into 0.1.1",
- "macron-input",
- "macron-inputln",
- "macron-path 0.1.3",
- "macron-regex",
- "macron-str",
-]
-
-[[package]]
-name = "macron"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9153767e22dca267dcdaacbcecdaed21f9c1866e8d727bad16e4e67be72b75e6"
@@ -5285,11 +5230,61 @@ checksum = "34ef732b61f40f1389705c10933930f022e9209760d5c06338407973ee8eca9c"
 dependencies = [
  "async-recursion",
  "async-trait",
- "macron-collections",
  "macron-impl-display 0.3.0",
  "macron-impl-error",
  "macron-impl-from 0.2.0",
  "macron-impl-into 0.2.0",
+ "macron-path 0.3.3",
+ "macron-regex",
+ "macron-str",
+]
+
+[[package]]
+name = "macron"
+version = "0.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9297cfc53bd7d4ac0d1f6c5304ba0d078fe6dc2d563839cf547aa741e2473fa4"
+dependencies = [
+ "async-recursion",
+ "async-trait",
+ "macron-impl-display 0.4.1",
+ "macron-impl-error",
+ "macron-impl-from 0.2.0",
+ "macron-impl-into 0.2.0",
+ "macron-regex",
+ "macron-str",
+]
+
+[[package]]
+name = "macron"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0dba62b950e879f7822ef8444c36393b58eae54324a0902a57c16ca7ec1cc44"
+dependencies = [
+ "async-recursion",
+ "async-trait",
+ "macron-impl-display 0.4.1",
+ "macron-impl-error",
+ "macron-impl-from 0.3.0",
+ "macron-impl-into 0.3.0",
+ "macron-path 0.3.3",
+ "macron-regex",
+ "macron-str",
+]
+
+[[package]]
+name = "macron"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc9982f66b81a46c17898fb34b07bf2c108ba1f80cd3ff2e1a9d9ca426c1746c"
+dependencies = [
+ "async-recursion",
+ "async-trait",
+ "macron-collections",
+ "macron-impl-display 0.5.0",
+ "macron-impl-error",
+ "macron-impl-from 0.3.0",
+ "macron-impl-into 0.3.0",
  "macron-input",
  "macron-inputln",
  "macron-path 0.3.3",
@@ -5304,17 +5299,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c911a66913c3cbb564a7b9cf21be7a506d040f87ad197c51782a6f0670428571"
 dependencies = [
  "macron-map",
-]
-
-[[package]]
-name = "macron-impl-display"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9ffb18d54a49dde4005773d8f2e2a709d2caa5561e8c8d430da4ec93a1c027f"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -5344,22 +5328,35 @@ dependencies = [
 ]
 
 [[package]]
-name = "macron-impl-error"
-version = "0.1.3"
+name = "macron-impl-display"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e788ed3443c15e4d96d446ed047595a7bc9c67d97f09e2bf07e710edf308ebe6"
+checksum = "393e9f27a7e855d825d71da316fdd38d898f9264f134686e2ddd08e6af011009"
 dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
  "quote",
  "syn 2.0.117",
 ]
 
 [[package]]
-name = "macron-impl-from"
-version = "0.1.1"
+name = "macron-impl-display"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a39985f0e374141b913618f753ca649da45dda47621cc4131959d721dc751635"
+checksum = "ef5b3dd1b2a2f29fa97dc14982dbce1f5d3fd1e5d2ae378be8c4bcf0986dcc81"
 dependencies = [
+ "heck 0.5.0",
  "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "macron-impl-error"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e788ed3443c15e4d96d446ed047595a7bc9c67d97f09e2bf07e710edf308ebe6"
+dependencies = [
  "quote",
  "syn 2.0.117",
 ]
@@ -5376,10 +5373,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "macron-impl-into"
-version = "0.1.1"
+name = "macron-impl-from"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b10b6f502ff432df11bccd9cabda7febdc3f52c901a64edb4c27df3f2f4b2ff"
+checksum = "b48d26d1feeffa8ddfc70b8b3e7935f58e81ca46c1391d5e96f95a88d0f760d9"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5391,6 +5388,17 @@ name = "macron-impl-into"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a69eb2137392517dc5f4d2602a3e6a7ab87d129ecfebe2b24af91a20c57406d9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "macron-impl-into"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da4d20bfe1270d1b55fd56e4ebee0f558e34f98697348b3157ca6fb2450b2f1f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5761,7 +5769,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8dbdc57af9d31a90b55a69f84293dd0f8a79ef6227ee7b27fdb4869b599adb82"
 dependencies = [
- "fuzzy-cmp 0.2.0",
+ "fuzzy-cmp",
  "lofty",
  "macron 0.2.1",
  "serde",
@@ -6433,19 +6441,19 @@ dependencies = [
 
 [[package]]
 name = "osy"
-version = "0.25.1"
+version = "0.26.0"
 dependencies = [
  "anylm",
- "atoman 0.12.2",
+ "atoman 0.14.2",
  "boa_engine",
  "chrono",
  "cistern",
  "heck 0.5.0",
  "include_dir",
  "libc",
- "macron 0.5.2",
+ "macron 0.8.0",
  "osy-share",
- "pearce 0.7.0",
+ "pearce",
  "rand 0.10.1",
  "regex",
  "rigging",
@@ -6457,15 +6465,15 @@ dependencies = [
 
 [[package]]
 name = "osy-forge"
-version = "0.2.0"
+version = "0.2.2"
 dependencies = [
  "anylm",
- "atoman 0.12.2",
+ "atoman 0.14.2",
  "chrono",
- "macron 0.5.2",
+ "macron 0.8.0",
  "osy-share",
  "osy-skill",
- "pearce 0.7.0",
+ "pearce",
  "rand 0.10.1",
  "regex",
  "rigging",
@@ -6475,15 +6483,15 @@ dependencies = [
 
 [[package]]
 name = "osy-home"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anylm",
- "atoman 0.12.2",
+ "atoman 0.14.2",
  "chrono",
- "macron 0.5.2",
+ "macron 0.8.0",
  "osy-share",
  "osy-skill",
- "pearce 0.7.0",
+ "pearce",
  "rand 0.10.1",
  "regex",
  "rigging",
@@ -6497,10 +6505,10 @@ name = "osy-share"
 version = "0.0.0"
 dependencies = [
  "anylm",
- "atoman 0.12.2",
+ "atoman 0.14.2",
  "chrono",
- "macron 0.5.2",
- "pearce 0.7.0",
+ "macron 0.8.0",
+ "pearce",
  "rand 0.10.1",
  "rigging",
  "serde",
@@ -6520,18 +6528,18 @@ dependencies = [
 
 [[package]]
 name = "osy-system"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anylm",
- "atoman 0.12.2",
+ "atoman 0.14.2",
  "base64 0.23.1",
  "chrono",
  "libc",
- "macron 0.5.2",
+ "macron 0.8.0",
  "music-index",
  "osy-share",
  "osy-skill",
- "pearce 0.7.0",
+ "pearce",
  "rand 0.10.1",
  "regex",
  "rigging",
@@ -6768,34 +6776,17 @@ dependencies = [
 
 [[package]]
 name = "pearce"
-version = "0.6.2"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "615f778674dc0ed3d5ed4128cdb60c3f89b45c47142672ce79346bede772bdf6"
+checksum = "3c1e5adeec6be30c5fdabfb94fbc60b889d5de310efdda51ffa63cfeb09a00a1"
 dependencies = [
- "atoman 0.12.2",
- "bytes",
- "futures",
- "hyper",
- "macron 0.5.2",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "pearce"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc9ed14bf7dd66cb31e671e58ba4d90b900f9a9688b453033e48ccc068bc1b17"
-dependencies = [
- "atoman 0.12.2",
+ "atoman 0.14.2",
  "axum",
  "bytes",
  "futures",
  "hyper",
  "hyper-util",
- "macron 0.5.2",
+ "macron 0.7.0",
  "reqwest 0.13.2",
  "serde",
  "serde_json",
@@ -7741,21 +7732,20 @@ dependencies = [
 
 [[package]]
 name = "rigging"
-version = "0.5.13"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29caef08e087d6a51520b76e20f81e6ab0e19c33fc947b2f891c460c1eac31f4"
+checksum = "6980822fad368aa4eab8f47f65a2c7a4469c260590fc8bbf66167a7489e1bf66"
 dependencies = [
  "adot-tree-sitter-toml",
  "async-trait",
- "atoman 0.11.8",
+ "atoman 0.14.2",
  "crossterm",
  "heck 0.5.0",
- "macron 0.5.2",
+ "macron 0.7.0",
  "markdown",
  "serde",
  "strip-ansi-escapes",
  "strsim",
- "tokio",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-go",
@@ -9531,9 +9521,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-stream"
-version = "0.1.18"
+version = "0.1.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
+checksum = "a3d06f0b082ba57c26b79407372e57cf2a1e28124f78e9479fe80322cf53420b"
 dependencies = [
  "futures-core",
  "pin-project-lite",

@@ -395,7 +395,10 @@ impl Session {
         let user_guard = user.read().await;
 
         let global_table = user_guard.kv_db.open_table(RULES_TABLE_NAME).await?;
-        global_table.read::<_, UserRule>(id).await
+        global_table
+            .read::<_, UserRule>(id)
+            .await
+            .map_err(Into::into)
     }
 
     /// Removes user rule by ID.
