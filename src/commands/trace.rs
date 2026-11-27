@@ -1,6 +1,6 @@
 use crate::prelude::*;
 
-use atoman::trace::{Filters, Source, Trace};
+use atoman::{Filters, Source, Tracer};
 use rigging::widgets::Print;
 use std::future::pending;
 
@@ -82,7 +82,7 @@ pub async fn handle_trace(uid_filter: Option<u64>, only_new: bool) -> Result<()>
     let filters = Filters::new(&[], &kv_pairs);
 
     // start multi-source log tracing
-    let _tracer = Trace::trace(sources, Duration::from_millis(200), filters).await;
+    let _tracer = Tracer::trace(sources, Duration::from_millis(200), filters).await;
 
     Print::info("Log tracer started. Waiting for events...")
         .render()

@@ -11,10 +11,46 @@ struct ToolMeta {
 }
 
 struct SkillMeta {
-    module: Option<Ident>,
+    module: Ident,
     description: String,
     prompt: String,
     tools: Vec<ToolMeta>,
+}
+
+fn to_snake_case_lower(ident: &Ident) -> String {
+    let raw = ident.to_string();
+    let mut out = String::with_capacity(raw.len() + 4);
+    for (i, ch) in raw.chars().enumerate() {
+        if ch.is_uppercase() {
+            if i != 0 {
+                out.push('_');
+            }
+            for lc in ch.to_lowercase() {
+                out.push(lc);
+            }
+        } else {
+            out.push(ch.to_lowercase().next().unwrap_or(ch));
+        }
+    }
+    out
+}
+
+fn extract_doc_description(attrs: &[Attribute]) -> String {
+    attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("doc"))
+        .filter_map(|attr| {
+            if let Meta::NameValue(nv) = &attr.meta {
+                if let Expr::Lit(expr_lit) = &nv.value {
+                    if let syn::Lit::Str(s) = &expr_lit.lit {
+                        return Some(s.value().trim().to_string());
+                    }
+                }
+            }
+            None
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[proc_macro_derive(AgentSkill, attributes(skill, tool))]
@@ -33,13 +69,7 @@ pub fn derive_agent_skill(input: TokenStream) -> TokenStream {
     for variant in data_enum.variants {
         let variant_name = &variant.ident;
         let meta = parse_variant_attributes(variant_name, &variant.attrs);
-
-        let module = meta.module.unwrap_or_else(|| {
-            panic!(
-                "#[skill(module = \"...\")] is required for variant {}",
-                variant_name
-            )
-        });
+        let module = meta.module;
 
         let base_prompt = format!(
             "Your domain responsibility: {}.\n\
@@ -75,7 +105,6 @@ pub fn derive_agent_skill(input: TokenStream) -> TokenStream {
             let action_type = tool.action_type;
             let no_action = tool.no_action;
 
-            // selecting Tool constructor depends on no_action
             let tool_constructor = if no_action {
                 quote! {
                     Tool::new(
@@ -94,7 +123,6 @@ pub fn derive_agent_skill(input: TokenStream) -> TokenStream {
 
             tool_typed_tokens.push(tool_constructor);
 
-            // call processing depending on the availability of the action
             if no_action {
                 tool_match_arms.push(quote! {
                     #tool_name_str => #module::#handler_fn(tx.clone()).await,
@@ -148,9 +176,13 @@ pub fn derive_agent_skill(input: TokenStream) -> TokenStream {
 }
 
 fn parse_variant_attributes(variant_name: &Ident, attrs: &[Attribute]) -> SkillMeta {
+    let module_str = to_snake_case_lower(variant_name);
+    let module_ident = Ident::new(&module_str, variant_name.span());
+    let description = extract_doc_description(attrs);
+
     let mut meta = SkillMeta {
-        module: None,
-        description: String::new(),
+        module: module_ident.clone(),
+        description,
         prompt: String::new(),
         tools: Vec::new(),
     };
@@ -163,26 +195,14 @@ fn parse_variant_attributes(variant_name: &Ident, attrs: &[Attribute]) -> SkillM
                 )
                 .unwrap_or_else(|err| {
                     panic!(
-                        "Failed to parse #[skill(...)] attribute on variant {}: {}",
+                        "Failed to parse skill attribute on variant {}: {}",
                         variant_name, err
                     )
                 });
 
             for item in nested {
                 if let Meta::NameValue(nv) = item {
-                    if nv.path.is_ident("module") {
-                        if let Expr::Lit(expr_lit) = nv.value {
-                            if let syn::Lit::Str(s) = expr_lit.lit {
-                                meta.module = Some(Ident::new(&s.value(), s.span()));
-                            }
-                        }
-                    } else if nv.path.is_ident("description") {
-                        if let Expr::Lit(expr_lit) = nv.value {
-                            if let syn::Lit::Str(s) = expr_lit.lit {
-                                meta.description = s.value();
-                            }
-                        }
-                    } else if nv.path.is_ident("prompt") {
+                    if nv.path.is_ident("prompt") {
                         if let Expr::Lit(expr_lit) = nv.value {
                             if let syn::Lit::Str(s) = expr_lit.lit {
                                 meta.prompt = s.value();
@@ -198,7 +218,7 @@ fn parse_variant_attributes(variant_name: &Ident, attrs: &[Attribute]) -> SkillM
                 )
                 .unwrap_or_else(|err| {
                     panic!(
-                        "Failed to parse #[tool(...)] attribute on variant {}: {}",
+                        "Failed to parse tool options on variant {}: {}",
                         variant_name, err
                     )
                 });
@@ -240,21 +260,13 @@ fn parse_variant_attributes(variant_name: &Ident, attrs: &[Attribute]) -> SkillM
                 }
             }
 
-            let name_lit = tool_name.expect("#[tool(name = \"...\")] is required");
-            let desc_lit = tool_desc.expect("#[tool(description = \"...\")] is required");
+            let name_lit = tool_name.expect("Tool name is required.");
+            let desc_lit = tool_desc.expect("Tool description is required.");
             let raw_name = name_lit.value();
 
-            // handler's name is always output as handle_{raw_name}
             let handler_name = format!("handle_{}", raw_name);
-            let module_ident = meta
-                .module
-                .as_ref()
-                .expect("Module must be specified before tools");
             let handler = Ident::new(&handler_name, name_lit.span());
 
-            // defining type of action structure:
-            // 1. If an explicit action is specified (for example, action = "media::VolumeAction")
-            // 2. Otherwise, generate the rule ToolName + Action (PascalCase)
             let action_type = if let Some(custom_action) = explicit_action {
                 let parsed_path: syn::Path = syn::parse_str(&custom_action)
                     .unwrap_or_else(|_| panic!("Invalid action path string: `{}`", custom_action));

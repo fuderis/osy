@@ -1,10 +1,10 @@
 use crate::prelude::*;
 
-use atoman::{Command, fs};
 use heck::ToPascalCase;
 use include_dir::{Dir, include_dir};
 use osy_share::StatusData;
 use rigging::{Stylize, widgets::Print};
+use tokio::{fs, process::Command};
 
 // Agent template files.
 static AGENT_TEMPLATE: Dir = include_dir!("$CARGO_MANIFEST_DIR/crates/agent");

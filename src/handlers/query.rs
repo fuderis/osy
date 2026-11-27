@@ -1,7 +1,7 @@
 use crate::{
     manager::Manager,
     prelude::*,
-    skills::{self, EvalAction, RememberFact, SearchFact, SkillAction},
+    skills::{self, EvalAction, ReadHistory, RememberFact, SearchFact, SkillAction},
     user::{Session, UserState},
     utils,
 };
@@ -10,10 +10,12 @@ use anylm::{
     api::{Content, Message, Messages, Visibility},
     completions::{Chunk, Completions},
 };
-use atoman::task::JoinSet;
 use osy_share::{Dialog, Event, HandleQuery, Id};
 use pearce::Callback;
 use rigging::widgets::Confirmation;
+use tokio::task::JoinSet;
+
+const DIALOG_MAP_MAX_CHARS: usize = 160;
 
 /// API: User query handler.
 pub async fn handle_user_query(paths: Paths<SessionId>, query: Json<HandleQuery>) -> Response {
@@ -23,29 +25,40 @@ pub async fn handle_user_query(paths: Paths<SessionId>, query: Json<HandleQuery>
         message,
     } = query.0;
 
-    Response::ok().stream(move |tx| async move {
-        let result = match Session::read(sid).await {
-            Ok((session, messages)) => {
+    Response::ok().stream(
+        move |tx| async move {
+            let result = async {
+                let session = Session::require(&sid)?;
+                let last_pair = session.lock().await.read_last_pair().await?;
+
+                let mut initial_msgs = Messages::new();
+                if let Some((prev_user, prev_assistant)) = last_pair {
+                    initial_msgs.add_message(prev_user);
+                    initial_msgs.add_message(prev_assistant);
+                }
+                let messages = Arc::new(Mutex::new(initial_msgs));
+
                 handle_query(
                     sid,
                     tx.clone(),
                     session,
                     messages,
-                    message,
+                    message.clone(),
+                    Some(message),
                     current_path,
-                    false,
                     0,
                 )
                 .await
             }
-            Err(e) => Err(e),
-        };
+            .await;
 
-        if let Err(e) = result {
-            error!("[handle_query{{sid={sid}}}] {e}");
-            tx.send(Event::Error(e.to_string())).ok();
-        }
-    })
+            if let Err(e) = result {
+                error!("[handle_query{{sid={sid}}}] {e}");
+                tx.send(Event::Error(e.to_string()).into()).await.ok();
+            }
+        },
+        1024,
+    )
 }
 
 /// Handles user query with direct parallel tool execution and self-healing.
@@ -57,8 +70,8 @@ async fn handle_query(
     session: Arc<Mutex<Session>>,
     messages: Arc<Mutex<Messages>>,
     message: Message,
+    root_user_msg: Option<Message>,
     current_path: Option<PathBuf>,
-    is_control: bool,
     iteration: usize,
 ) -> Result<()> {
     info!("Processing the user query (iteration {iteration})...");
@@ -70,8 +83,18 @@ async fn handle_query(
 
     // loop repeats the CURRENT iteration in case of an error
     'iteration_loop: loop {
-        // 1. RAG: Search for relevant facts about the user and load Session Rules
+        // 1. RAG, Rules & Session Dialog Map
         let session_guard = session.lock().await;
+        let base_system_prompt = utils::system_prompt(&session_guard.info, &cfg);
+
+        let dialog_map_prompt = match session_guard.dialog_map(DIALOG_MAP_MAX_CHARS).await {
+            Ok(map) => map,
+            Err(e) => {
+                error!("[DialogMap] Failed to build session dialog map: {e}");
+                String::new()
+            }
+        };
+
         let mut facts_prompt = String::new();
         let mut rules_prompt = String::new();
 
@@ -91,14 +114,14 @@ async fn handle_query(
             }
             Err(e) => error!("[Rules] Failed to load session rules: {e}"),
         }
+        drop(session_guard);
 
         let user_text = message.extract_texts().join("\n\n");
         if !user_text.trim().is_empty() {
             match {
                 let user = UserState::get_or_init(sid.user_id).await?;
-                let user_guard = user.read().await;
                 let limit = Config::get().context.search_limit;
-                user_guard.search_facts(&user_text, Some(limit)).await
+                user.search_facts(&user_text, Some(limit)).await
             } {
                 Ok(facts) if !facts.is_empty() => {
                     facts_prompt.push_str("LOADED USER FACTS (USE THEM WHEN NECESSARY):\n");
@@ -112,32 +135,48 @@ async fn handle_query(
             }
         }
 
-        // 2. Preparing the context and system prompts
+        // 2. Preparing the context:
+        //    1) Dialog map at the very top as a system anchor
+        //    2) Previous turn pair & current turn steps from `raw_messages`
+        //    3) System prompt (base + rules + facts + skills) before the latest message
         let raw_messages = messages.lock().await.messages.clone();
-        let base_system_prompt = utils::system_prompt(&session_guard.info, &cfg);
-        drop(session_guard);
 
-        if !is_control {
-            session.lock().await.write_message(message.clone()).await?;
+        let system_body = [base_system_prompt, rules_prompt, facts_prompt]
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n---\n");
+
+        let mut builder = Messages::new();
+
+        if !dialog_map_prompt.trim().is_empty() {
+            builder = builder.message(
+                Message::system(vec![dialog_map_prompt.into()]).visibility(Visibility::Internal),
+            );
         }
 
-        let messages = Messages::from(raw_messages)
-            .message(
-                Message::system(vec![
-                    format!("{base_system_prompt}\n\n---\n{rules_prompt}\n\n---\n{facts_prompt}")
-                        .into(),
-                    assist_prompt
-                        .replace("{AGENTS_LIST}", &Manager::agents_doc().await)
-                        .into(),
-                ])
-                .visibility(Visibility::Internal),
-            )
-            .message(message.clone())
-            .wrap();
+        for m in raw_messages {
+            builder = builder.message(m);
+        }
+
+        builder = builder.message(
+            Message::system(vec![
+                system_body.into(),
+                assist_prompt
+                    .replace("{AGENTS_LIST}", &Manager::agents_doc().await)
+                    .into(),
+            ])
+            .visibility(Visibility::Internal),
+        );
+
+        let messages = builder.message(message.clone()).wrap();
+
+        warn!("CONTEXT MESSAGES: {:#?}", messages.lock().await); // DEBUG
 
         let mut agent_tasks = vec![];
         let mut evals_list = vec![];
         let mut memory_results = vec![];
+        let mut final_text_response = str!();
 
         let mut retry_count = 0;
         let max_retries = exec_options.max_retries.max(1);
@@ -179,14 +218,14 @@ async fn handle_query(
             };
 
             let mut chunk_error = None;
-            while let Some(chunk) = atoman::select! {
+            while let Some(chunk) = tokio::select! {
                 _ = tx.closed() => return Err(Error::ConnectionClosed.into()),
                 chunk = response.next() => chunk,
             } {
                 match chunk {
                     Ok(Chunk::Text(text_part)) => {
                         text_response.push_str(&text_part);
-                        tx.send(Event::Answer(text_part))?;
+                        tx.send(Event::Answer(text_part).into()).await?;
                     }
                     Ok(Chunk::Tool(tool_call)) => match tool_call.func.name.as_ref() {
                         "use_skill" => match tool_call.parse_args::<SkillAction>() {
@@ -208,20 +247,16 @@ async fn handle_query(
                             }
                         },
                         "remember_fact" => match tool_call.parse_args::<RememberFact>() {
-                            Ok(act) => {
-                                match {
-                                    let user = UserState::get_or_init(sid.user_id).await?;
-                                    let user_guard = user.read().await;
-                                    skills::handle_remember_fact(&user_guard, act).await
-                                } {
-                                    Ok(res_msg) => memory_results.push((tool_call.id, res_msg)),
-                                    Err(e) => {
-                                        chunk_error =
-                                            Some(format!("Failed to save fact: {e}").into());
-                                        break;
-                                    }
+                            Ok(act) => match {
+                                let user = UserState::get_or_init(sid.user_id).await?;
+                                skills::handle_remember_fact(&user, act).await
+                            } {
+                                Ok(res_msg) => memory_results.push((tool_call.id, res_msg)),
+                                Err(e) => {
+                                    chunk_error = Some(format!("Failed to save fact: {e}").into());
+                                    break;
                                 }
-                            }
+                            },
                             Err(e) => {
                                 chunk_error =
                                     Some(format!("Failed to parse remember_fact: {e}").into());
@@ -229,23 +264,38 @@ async fn handle_query(
                             }
                         },
                         "search_fact" => match tool_call.parse_args::<SearchFact>() {
-                            Ok(act) => {
-                                match {
-                                    let user = UserState::get_or_init(sid.user_id).await?;
-                                    let user_guard = user.read().await;
-                                    skills::handle_search_fact(&user_guard, act).await
-                                } {
-                                    Ok(res_msg) => memory_results.push((tool_call.id, res_msg)),
-                                    Err(e) => {
-                                        chunk_error =
-                                            Some(format!("Failed to search facts: {e}").into());
-                                        break;
-                                    }
+                            Ok(act) => match {
+                                let user = UserState::get_or_init(sid.user_id).await?;
+                                skills::handle_search_fact(&user, act).await
+                            } {
+                                Ok(res_msg) => memory_results.push((tool_call.id, res_msg)),
+                                Err(e) => {
+                                    chunk_error =
+                                        Some(format!("Failed to search facts: {e}").into());
+                                    break;
                                 }
-                            }
+                            },
                             Err(e) => {
                                 chunk_error =
                                     Some(format!("Failed to parse search_fact: {e}").into());
+                                break;
+                            }
+                        },
+                        "read_history" => match tool_call.parse_args::<ReadHistory>() {
+                            Ok(act) => match {
+                                let user = UserState::get_or_init(sid.user_id).await?;
+                                skills::handle_read_history(&user, act).await
+                            } {
+                                Ok(res_msg) => memory_results.push((tool_call.id, res_msg)),
+                                Err(e) => {
+                                    chunk_error =
+                                        Some(format!("Failed to read history: {e}").into());
+                                    break;
+                                }
+                            },
+                            Err(e) => {
+                                chunk_error =
+                                    Some(format!("Failed to parse read_history: {e}").into());
                                 break;
                             }
                         },
@@ -296,12 +346,13 @@ async fn handle_query(
                 }
             }
 
+            final_text_response = text_response;
             break Ok(());
         };
 
         // if planning has failed after all the retreats
         if let Err(e) = planning_res {
-            tx.send(Event::Error(e.to_string())).ok();
+            tx.send(Event::Error(e.to_string()).into()).await.ok();
             let prompt =
                 format!("The planning failed with an error: {e}. Do you want to try again?");
             if ask_retry(&tx, prompt).await.unwrap_or(false) {
@@ -314,25 +365,38 @@ async fn handle_query(
             }
         }
 
+        let has_memory_ops = !memory_results.is_empty();
+        let has_evals = !evals_list.is_empty();
+        let has_tasks = !agent_tasks.is_empty();
+
+        if has_memory_ops || has_evals || has_tasks {
+            let mut guard = messages.lock().await;
+            if iteration == 0 {
+                guard.add_message(message.clone());
+            }
+        }
+
         // 3. Process Memory Operations & Notifications
-        if !memory_results.is_empty() {
+        if has_memory_ops {
             let mut msg_guard = messages.lock().await;
             for (tool_call_id, res_text) in memory_results {
-                tx.send(Event::Thinking(res_text.clone()))?;
+                tx.send(Event::Thinking(res_text.clone()).into()).await?;
                 let content_item: Content = format!("Memory Operation Result:\n{res_text}").into();
                 msg_guard.push_content(Some(&tool_call_id), content_item);
             }
         }
 
         // 4. Performing JS calculations
-        let has_evals = !evals_list.is_empty();
-        if !evals_list.is_empty() {
+        if has_evals {
             let mut results: Vec<(String, String)> = vec![];
             for (tool_call_id, eval) in evals_list {
-                tx.send(Event::Thinking(format!(
-                    "Executing JavaScript code: {:80}...",
-                    &eval.code
-                )))?;
+                tx.send(
+                    Event::Thinking(
+                        format!("Executing JavaScript code: {:80}...", &eval.code).into(),
+                    )
+                    .into(),
+                )
+                .await?;
                 let result = skills::handle_eval(eval).await?;
                 results.push((tool_call_id, format!("JS Result:\n{result}").into()));
             }
@@ -347,7 +411,6 @@ async fn handle_query(
 
         // 5. Parallel Tool/Agent Execution
         let mut execution_error = None;
-        let has_tasks = !agent_tasks.is_empty();
         if has_tasks {
             info!("Executing {} agent tasks in parallel", agent_tasks.len());
             let mut workers = JoinSet::new();
@@ -374,7 +437,7 @@ async fn handle_query(
             }
 
             loop {
-                atoman::select! {
+                tokio::select! {
                     _ = tx.closed() => {
                         warn!("Client disconnected, aborting agent execution");
                         workers.abort_all();
@@ -400,7 +463,7 @@ async fn handle_query(
 
         // if task execution has dropped after max_retries inside handle_task
         if let Some(err) = execution_error {
-            tx.send(Event::Error(err.to_string())).ok();
+            tx.send(Event::Error(err.to_string()).into()).await.ok();
             let prompt =
                 format!("Task processing failed with an error: {err}. Do you want to try again?");
             if ask_retry(&tx, prompt).await.unwrap_or(false) {
@@ -412,24 +475,23 @@ async fn handle_query(
         }
 
         // 6. Recursion / Control Step Dispatch
-        let had_actions = has_tasks || has_evals;
+        let had_actions = has_tasks || has_evals || has_memory_ops;
 
-        if !is_control && had_actions {
+        if had_actions {
             if iteration + 1 >= exec_options.max_iterations {
                 warn!(
                     "Reached maximum allowed iterations ({}), stopping recursive execution.",
                     exec_options.max_iterations
                 );
-                tx.send(Event::Finish)?;
+                tx.send(Event::Finish.into()).await?;
 
-                let to_save = messages
-                    .lock()
-                    .await
-                    .slice(-1)
-                    .into_iter()
-                    .filter(|msg| msg.role.is_assistant())
-                    .collect::<Vec<_>>();
-                session.lock().await.write_messages(to_save).await?;
+                persist_turn_pair(
+                    &session,
+                    &messages,
+                    root_user_msg.clone(),
+                    &final_text_response,
+                )
+                .await?;
             } else {
                 info!(
                     "Sub-tasks finished. Launching control query (iteration {})...",
@@ -444,25 +506,18 @@ async fn handle_query(
                     session,
                     messages,
                     control_msg,
+                    root_user_msg.clone(),
                     current_path,
-                    true,
                     iteration + 1,
                 )
                 .await?;
             }
         } else {
-            // if control request OR no actions (direct response to the user)
-            tx.send(Event::Finish)?;
+            // no actions (direct final response to the user)
+            tx.send(Event::Finish.into()).await?;
             info!("Query processing finished completely.");
 
-            let to_save = messages
-                .lock()
-                .await
-                .slice(-1)
-                .into_iter()
-                .filter(|msg| msg.role.is_assistant())
-                .collect::<Vec<_>>();
-            session.lock().await.write_messages(to_save).await?;
+            persist_turn_pair(&session, &messages, root_user_msg, &final_text_response).await?;
         }
 
         break 'iteration_loop;
@@ -471,18 +526,53 @@ async fn handle_query(
     Ok(())
 }
 
+/// Persists `(User, Assistant)` pair when a top-level turn finishes.
+async fn persist_turn_pair(
+    session: &Arc<Mutex<Session>>,
+    messages: &Arc<Mutex<Messages>>,
+    root_user_msg: Option<Message>,
+    final_text_response: &str,
+) -> Result<()> {
+    let Some(user_msg) = root_user_msg else {
+        return Ok(());
+    };
+
+    let assistant_msg = if !final_text_response.trim().is_empty() {
+        Message::assistant(vec![final_text_response.to_owned().into()], vec![])
+    } else {
+        messages
+            .lock()
+            .await
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role.is_assistant())
+            .cloned()
+            .unwrap_or_else(|| Message::assistant(vec!["".into()], vec![]))
+    };
+
+    let pair = (user_msg, assistant_msg);
+    session.lock().await.write_messages(pair).await?;
+
+    Ok(())
+}
+
 /// Requesting confirmation from the user to try again in case of an error.
 async fn ask_retry(tx: &Sender<Bytes>, prompt: String) -> Result<bool> {
     let id = Id::new().to_string();
-    let mut callback = Callback::register(&id).await;
+    let mut callback = Callback::register(&id);
 
-    tx.send(Event::Dialog(Dialog::Confirm {
-        id,
-        prompt,
-        default: Some(Confirmation::Yes),
-    }))?;
+    tx.send(
+        Event::Dialog(Dialog::Confirm {
+            id,
+            prompt,
+            default: Some(Confirmation::Yes),
+        })
+        .into(),
+    )
+    .await?;
 
-    let response = atoman::select! {
+    let response = tokio::select! {
         _ = tx.closed() => return Err(Error::ConnectionClosed.into()),
         res = callback.recv::<Confirmation>(Duration::from_secs(300)) => res,
     };

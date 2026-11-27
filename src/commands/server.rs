@@ -1,9 +1,13 @@
 use crate::prelude::*;
 
-use atoman::{io::AsyncReadExt, process::Command, time::sleep};
 use osy_share::{AgentMeta, StatusData};
 use rigging::{Stylize, widgets::Print};
 use std::{net::TcpListener, process::Stdio, time::Duration};
+use tokio::{
+    io::AsyncReadExt,
+    process::{Child, Command},
+    time::sleep,
+};
 
 /// API: Handles server status checking.
 pub async fn handle_server_status() -> Result<()> {
@@ -209,7 +213,7 @@ async fn ping_server(client: &Client, port: &str) -> bool {
 }
 
 async fn wait_for_server_start(
-    child: &mut atoman::process::Child,
+    child: &mut Child,
     client: &Client,
     port: &str,
     retries: usize,

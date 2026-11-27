@@ -18,6 +18,7 @@ name = "osy-share"
 edition = "2024"
 
 [dependencies]
+tokio.workspace = true
 macron.workspace = true
 atoman.workspace = true
 anylm.workspace = true

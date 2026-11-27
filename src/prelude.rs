@@ -8,10 +8,8 @@ pub use osy_share::{Id, SessionId};
 pub use atoman::{
     DynError, Result, StdResult,
     logger::{LogExt, Logger, Span, error, info, log, warn},
-    shared::{SharedGuard, SharedGuardMut, SharedItem, SharedMap},
+    shared::{SharedMap, SharedSet},
     state::{State, StateGuard},
-    sync::{Mutex, RwLock},
-    time::Instant,
 };
 pub use std::{
     collections::{HashMap, HashSet},
@@ -20,11 +18,12 @@ pub use std::{
     sync::Arc,
     time::Duration,
 };
+pub use tokio::sync::{Mutex, RwLock, mpsc::Sender};
 
 // Ecosystem crates
 pub use chrono::{DateTime, Local, Utc};
 pub use macron::{Display, From, arc, async_recursion, async_trait, path, str};
-pub use pearce::{Bytes, Client, Json, Paths, Query, Receiver, Response, Sender, StreamExt};
+pub use pearce::{Bytes, Client, Json, Paths, Query, Response, StreamExt};
 
 // Serialization
 pub use serde::{Deserialize, Serialize};

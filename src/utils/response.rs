@@ -1,6 +1,5 @@
 use crate::prelude::*;
 
-use atoman::io::AsyncWriteExt;
 use osy_share::{CommandResult, Dialog, Event};
 use rigging::{
     Stylize,
@@ -8,6 +7,7 @@ use rigging::{
     style::{Align, LineStyle, SpinnerStyle},
 };
 use std::process::Stdio;
+use tokio::{io::AsyncWriteExt, process::Command};
 
 /// Renders CLI response widget.
 pub async fn render_response<T>(url: String, body: T) -> Result<()>
@@ -35,7 +35,11 @@ where
             let mut status_msg: Option<String> = None;
 
             // establish async SSE event stream connection with server
-            let res = Client::tcp().post(&url).json(&body).stream::<Event>().await;
+            let res = Client::tcp()
+                .post(&url)
+                .json(&body)
+                .stream::<Event>(1024)
+                .await;
 
             match res {
                 Ok(mut stream) => {
@@ -51,7 +55,7 @@ where
                     };
 
                     // process streaming tokens and update widget buffer in real time
-                    while let Ok(Some(event)) = stream.recv().await {
+                    while let Some(Ok(event)) = stream.recv().await {
                         received_any_event = true;
 
                         match event {
@@ -62,6 +66,7 @@ where
                                 ctx.notify();
                             }
                             Event::Answer(chunk) => {
+                                status_msg = None;
                                 full_response.push_str(&chunk);
                                 update_ui(&mut ctx.state, &full_response, status_msg.as_deref());
                                 ctx.sync();
@@ -93,7 +98,7 @@ where
                                     {
                                         // if sudo is required, check ‘sudo -n true’ with suppressed output
                                         let sudo_valid = if use_sudo {
-                                            atoman::process::Command::new("sudo")
+                                            Command::new("sudo")
                                                 .arg("-n")
                                                 .arg("true")
                                                 .stdout(Stdio::null())
@@ -127,14 +132,13 @@ where
                                             {
                                                 if !password.trim().is_empty() {
                                                     // validate and cache the session using sudo -S -v.
-                                                    if let Ok(mut child) =
-                                                        atoman::process::Command::new("sudo")
-                                                            .arg("-S")
-                                                            .arg("-v")
-                                                            .stdin(Stdio::piped())
-                                                            .stdout(Stdio::null())
-                                                            .stderr(Stdio::null())
-                                                            .spawn()
+                                                    if let Ok(mut child) = Command::new("sudo")
+                                                        .arg("-S")
+                                                        .arg("-v")
+                                                        .stdin(Stdio::piped())
+                                                        .stdout(Stdio::null())
+                                                        .stderr(Stdio::null())
+                                                        .spawn()
                                                     {
                                                         if let Some(mut stdin) = child.stdin.take()
                                                         {
@@ -170,18 +174,12 @@ where
                                     ctx.notify();
 
                                     #[cfg(target_os = "windows")]
-                                    let output = atoman::process::Command::new("cmd")
-                                        .arg("/C")
-                                        .arg(&code)
-                                        .output()
-                                        .await;
+                                    let output =
+                                        Command::new("cmd").arg("/C").arg(&code).output().await;
 
                                     #[cfg(not(target_os = "windows"))]
-                                    let output = atoman::process::Command::new("bash")
-                                        .arg("-c")
-                                        .arg(&code)
-                                        .output()
-                                        .await;
+                                    let output =
+                                        Command::new("bash").arg("-c").arg(&code).output().await;
 
                                     let result_payload = match output {
                                         Ok(out) => CommandResult {

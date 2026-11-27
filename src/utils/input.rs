@@ -1,13 +1,9 @@
 use crate::prelude::*;
 
 use osy_share::{
-    CompactQuery, Event, ListQuery, RemoveQuery, RenameQuery, SearchQuery, SessionId, SetQuery,
-    UserFact, UserRule,
+    ListQuery, RemoveQuery, RenameQuery, SearchQuery, SessionId, SetQuery, UserFact, UserRule,
 };
-use rigging::{
-    Stylize,
-    style::{Align, SpinnerStyle},
-};
+use rigging::{Stylize, style::Align};
 
 #[derive(serde::Deserialize)]
 struct CloneResponse {
@@ -43,7 +39,7 @@ async fn send_post<T: serde::Serialize>(
     client: &Client,
     url: &str,
     json: Option<&T>,
-) -> StdResult<pearce::client::Response, String> {
+) -> StdResult<pearce::ClientResponse, String> {
     let mut req = client.post(url);
     if let Some(body) = json {
         req = req.json(body);
@@ -149,7 +145,6 @@ pub async fn render_input(
                         ("clone", "Clone the current session"),
                         ("rename <name>", "Rename current session"),
                         ("remove", "Remove/delete current session"),
-                        ("compact [N]", "Compress context preserving N messages"),
                         ("facts list [count]", "List stored facts"),
                         ("facts add <fact>", "Save a new fact (alias: /remember)"),
                         ("facts search <query>", "Search stored facts"),
@@ -524,7 +519,7 @@ pub async fn render_input(
                     };
 
                     let msg = match send_post(client, &endpoint, Some(&query)).await {
-                        Ok(_) => format!("Session renamed to `{payload}`."),
+                        Ok(_) => format!("Session renamed to `{top_payload}`."),
                         Err(err) => err,
                     };
 
@@ -553,61 +548,6 @@ pub async fn render_input(
                     };
 
                     render_msg(msg).await?;
-                    continue;
-                }
-
-                "compact" | "compress" => {
-                    let preserve = clean_args
-                        .first()
-                        .and_then(|i| i.parse::<usize>().ok())
-                        .unwrap_or_else(|| Config::get().execution.preserve_messages);
-
-                    super::text_widget("Compressing context...")
-                        .title(" Thinking... ".bold().with(brand_color), Align::TopLeft)
-                        .spinner_style(SpinnerStyle::Dots)
-                        .spinner_color(brand_color)
-                        .handler(move |mut ctx| async move {
-                            let endpoint = format!("{base_url}/sessions/{sid}/compact");
-                            let res = Client::tcp()
-                                .post(&endpoint)
-                                .json(&CompactQuery {
-                                    preserve: Some(preserve),
-                                })
-                                .stream::<Event>()
-                                .await;
-
-                            match res {
-                                Ok(mut stream) => {
-                                    let mut summary = String::new();
-                                    while let Ok(Some(event)) = stream.recv().await {
-                                        match event {
-                                            Event::Thinking(status) => {
-                                                *ctx.state = format!("[{status}]");
-                                                ctx.notify();
-                                            }
-                                            Event::Answer(text) => {
-                                                summary.push_str(&text);
-                                                *ctx.state = summary.clone();
-                                                ctx.notify();
-                                            }
-                                            Event::Error(err) => {
-                                                *ctx.state = format!("Compression error: {err}");
-                                                ctx.notify();
-                                            }
-                                            Event::Dialog(_) => {}
-                                            Event::Finish => break,
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    *ctx.state = format!("Network error: {e}");
-                                    ctx.notify();
-                                }
-                            }
-                            ctx.finish();
-                        })
-                        .render()
-                        .await?;
                     continue;
                 }
 

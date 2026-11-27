@@ -1,18 +1,19 @@
 use super::{MANAGER, Manager};
 use crate::prelude::*;
 
-use atoman::{
-    net::UnixStream,
-    process::{Child, Command},
-    sync::Mutex,
-    time,
-};
 use osy_share::AgentMeta;
 use pearce::Client;
 use std::{
     process::Stdio,
     sync::Arc,
     time::{Duration, SystemTime},
+};
+use tokio::{
+    fs,
+    net::UnixStream,
+    process::{Child, Command},
+    sync::Mutex,
+    time,
 };
 
 /// Agent instance.
@@ -118,7 +119,7 @@ impl Agent {
 
         // register in manager
         let name = agent.metadata.name.clone();
-        MANAGER.get().agents.insert(name.clone(), agent).await;
+        MANAGER.get().agents.insert(name.clone(), Arc::new(agent));
 
         info!("[Manager] Agent `{name}` added to manager.");
         Manager::gen_doc().await;
@@ -132,7 +133,7 @@ impl Agent {
         let name = &self.metadata.name;
         info!("[Manager] Trying to stop `{name}` agent...");
 
-        if MANAGER.get().agents.remove(name).await.is_some() {
+        if MANAGER.get().agents.remove(name).is_some() {
             info!("[Manager] Agent `{name}` stopped.");
             Manager::gen_doc().await;
         } else {
@@ -160,7 +161,7 @@ impl Agent {
 
         // check execution file metadata
         if deep_check {
-            let metadata = atoman::fs::metadata(&self.exec_path).await?;
+            let metadata = fs::metadata(&self.exec_path).await?;
 
             if let Ok(modified_at) = metadata.modified()
                 && let Some(started_at) = self._started

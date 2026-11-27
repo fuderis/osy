@@ -15,51 +15,52 @@ pub async fn handle_tool_call(
         payload,
     } = query.0;
 
-    Response::ok().stream(async move |tx| {
-        let Some(agent) = Manager::get_by_skill(&skill_name).await else {
-            let err_msg = format!("Agent for skill `{skill_name}` not found.");
-            error!("[handle_tool_call] {err_msg}");
-            let _ = tx.send(Event::Error(err_msg));
-            return;
-        };
+    Response::ok().stream(
+        async move |tx| {
+            let Some(agent) = Manager::get_by_skill(&skill_name).await else {
+                let err_msg = format!("Agent for skill `{skill_name}` not found.");
+                error!("[handle_tool_call] {err_msg}");
+                let _ = tx.send(Event::Error(err_msg).into()).await;
+                return;
+            };
 
-        let agent_guard = agent.read().await;
-        let sock_path = agent_guard.metadata.sock_path.to_string_lossy().to_string();
-        let agent_name = agent_guard.metadata.name.clone();
-        drop(agent_guard);
+            let sock_path = agent.metadata.sock_path.to_string_lossy().to_string();
+            let agent_name = agent.metadata.name.clone();
 
-        let tool_call = ToolCall {
-            id: "".into(),
-            kind: "".into(),
-            func: ToolCallFunction {
-                name: tool_name,
-                json_str: payload.to_string(),
-            },
-        };
+            let tool_call = ToolCall {
+                id: "".into(),
+                kind: "".into(),
+                func: ToolCallFunction {
+                    name: tool_name,
+                    json_str: payload.to_string(),
+                },
+            };
 
-        let client = Client::ipc(&sock_path);
+            let client = Client::ipc(&sock_path);
 
-        match handle_tool(
-            client,
-            sock_path,
-            agent_name,
-            skill_name,
-            tool_call,
-            current_path,
-            tx.clone(),
-        )
-        .await
-        {
-            Ok((_, result_text)) => {
-                let _ = tx.send(Event::Answer(result_text));
-                let _ = tx.send(Event::Finish);
+            match handle_tool(
+                client,
+                sock_path,
+                agent_name,
+                skill_name,
+                tool_call,
+                current_path,
+                tx.clone(),
+            )
+            .await
+            {
+                Ok((_, result_text)) => {
+                    tx.send(Event::Answer(result_text).into()).await.ok();
+                    tx.send(Event::Finish.into()).await.ok();
+                }
+                Err(e) => {
+                    error!("[handle_tool_call] Execution failed: {e}");
+                    tx.send(Event::Error(e.to_string()).into()).await.ok();
+                }
             }
-            Err(e) => {
-                error!("[handle_tool_call] Execution failed: {e}");
-                let _ = tx.send(Event::Error(e.to_string()));
-            }
-        }
-    })
+        },
+        1024,
+    )
 }
 
 /// Performs a single call to the agent's tool via IPC.
@@ -82,7 +83,7 @@ pub async fn handle_tool(
         func.name
     );
     info!("{msg}");
-    tx.send(Event::Thinking(msg)).ok();
+    tx.send(Event::Thinking(msg).into()).await.ok();
 
     let request_path = format!("/skills/{skill_name}/call/{}", func.name);
     let request_body = ToolQuery {
@@ -92,22 +93,26 @@ pub async fn handle_tool(
     let mut response = client
         .post(&request_path)
         .json(&request_body)
-        .stream::<Event>()
+        .stream::<Event>(1024)
         .await;
 
     // error checking and auto-recovery of the agent if necessary
     if let Err(e) = &response {
         warn!("Agent `{agent_name}` didn't respond for tool call: {e}");
-        tx.send(Event::Thinking(format!(
-            "Agent `{agent_name}` didn't respond for tool call."
-        )))?;
+        tx.send(
+            Event::Thinking(format!(
+                "Agent `{agent_name}` didn't respond for tool call."
+            ))
+            .into(),
+        )
+        .await?;
 
         if let Some(agent) = Manager::get_agent(&agent_name).await {
-            if agent.read().await.ensure().await.is_ok() {
+            if agent.ensure().await.is_ok() {
                 response = Client::ipc(&sock_path)
                     .post(&request_path)
                     .json(&request_body)
-                    .stream::<Event>()
+                    .stream::<Event>(1024)
                     .await;
             }
         } else {
@@ -130,19 +135,19 @@ pub async fn handle_tool(
 
     let mut full_text = str!();
 
-    while let Some(event) = atoman::select! {
+    while let Some(event) = tokio::select! {
         _ = tx.closed() => return Err(Error::ConnectionClosed.into()),
-        res = stream.recv() => res?,
+        res = stream.recv() => res,
     } {
-        match event {
+        match event? {
             Event::Answer(text) => full_text.push_str(&text),
             Event::Finish => {}
             Event::Dialog(d_event) => {
                 let d_event_id = d_event.get_id().to_string();
-                let mut callback = Callback::register(&d_event_id).await;
-                tx.send(Event::Dialog(d_event))?;
+                let mut callback = Callback::register(&d_event_id);
+                tx.send(Event::Dialog(d_event).into()).await?;
 
-                let response = atoman::select! {
+                let response = tokio::select! {
                     _ = tx.closed() => return Err(Error::ConnectionClosed.into()),
                     res = callback.recv::<JsonValue>(Duration::from_secs(120)) => res?,
                 };
@@ -162,7 +167,7 @@ pub async fn handle_tool(
                 }
             }
             event => {
-                let _ = tx.send(event);
+                let _ = tx.send(event.into()).await;
             }
         }
     }

@@ -3,9 +3,9 @@ macro_rules! macos_proc_protect {
     () => {{
         #[cfg(target_os = "macos")]
         {
-            ::atoman::spawn(async {
-                use ::atoman::io::AsyncReadExt;
-                let mut std_in = ::atoman::io::stdin();
+            ::tokio::spawn(async {
+                use ::tokio::io::AsyncReadExt;
+                let mut std_in = ::tokio::io::stdin();
                 let mut buf = [0; 1];
                 if let Ok(0) = std_in.read(&mut buf).await {
                     ::std::process::exit(0);

@@ -1,21 +1,26 @@
 use crate::{prelude::*, user::Session};
 
-use anylm::{
-    api::{Message, Messages},
-    completions::{Chunk, Completions},
-};
-use osy_share::{CompactQuery, Event, RemoveQuery, RenameQuery, SessionId, SessionInfo, SetQuery};
+use osy_share::{RemoveQuery, RenameQuery, SessionId, SessionInfo, SetQuery};
+
+/// Returns the active session or early-returns an error response.
+macro_rules! session {
+    ($sid:expr) => {
+        match Session::require(&$sid) {
+            Ok(session) => session,
+            Err(e) => {
+                error!("{e}");
+                return Response::error().text(e.to_string());
+            }
+        }
+    };
+}
 
 /// API: Returns session metadata by ID.
 #[log(sid = %sid)]
 pub async fn handle_session_metadata(Paths(sid): Paths<SessionId>) -> Response {
     info!("Fetching metadata for session `{sid}`...");
 
-    let Some(session_shared) = Session::get(&sid).await else {
-        let err_msg = format!("Undefined session id `{sid}`");
-        error!("{err_msg}");
-        return Response::error().text(err_msg);
-    };
+    let session_shared = session!(sid);
 
     info!("Waiting for session lock...");
     let metadata = {
@@ -26,7 +31,7 @@ pub async fn handle_session_metadata(Paths(sid): Paths<SessionId>) -> Response {
     Response::ok().json(&metadata)
 }
 
-/// API: Initializes user session and returns its messages
+/// API: Initializes user session and returns its messages.
 #[log(sid = %sid)]
 pub async fn handle_session_init(
     Paths(sid): Paths<SessionId>,
@@ -35,19 +40,13 @@ pub async fn handle_session_init(
     let session_info = query.0;
     info!("Handling session init/get...");
 
-    // check active session, or initialize a new one
-    let session_shared = match Session::get(&sid).await {
-        Some(existing) => {
-            info!("Found existing session in memory");
-            existing
+    // get active session, or initialize a new one
+    let session_shared = match Session::get_or_init(sid, session_info).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to init session {sid}: {e}");
+            return Response::error().text(e.to_string());
         }
-        None => match Session::init(sid, session_info).await {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to init session {sid}: {e}");
-                return Response::error().text(e.to_string());
-            }
-        },
     };
 
     info!("Waiting for session lock...");
@@ -67,7 +66,7 @@ pub async fn handle_session_init(
     }
 }
 
-/// API: Finishes user session and flushes DB to prevent lock contention
+/// API: Finishes user session and flushes DB to prevent lock contention.
 #[log(sid = %sid)]
 pub async fn handle_session_finish(Paths(sid): Paths<SessionId>) -> Response {
     match Session::finish(&sid).await {
@@ -88,11 +87,7 @@ pub async fn handle_session_rename(
     let RenameQuery { name } = query.0;
     info!("Renaming session `{sid}` to `{name}`...");
 
-    let Some(session_shared) = Session::get(&sid).await else {
-        let err_msg = format!("Undefined session id `{sid}`");
-        error!("{err_msg}");
-        return Response::error().text(err_msg);
-    };
+    let session_shared = session!(sid);
 
     info!("Waiting for session lock...");
     let rename_res = {
@@ -115,142 +110,12 @@ pub async fn handle_session_rename(
     }
 }
 
-/// API: Handles session compression.
-#[log(sid = %sid)]
-pub async fn handle_session_compact(
-    Paths(sid): Paths<SessionId>,
-    query: Json<CompactQuery>,
-) -> Response {
-    let CompactQuery { preserve } = query.0;
-    let current = Span::current();
-
-    Response::ok().stream(move |tx| {
-        async move {
-            let cfg = Config::get();
-            let preserve_count = preserve.unwrap_or(cfg.execution.preserve_messages);
-            let provider_options = cfg.llm.compress_options();
-            let compress_prompt = cfg.llm.compress_prompt();
-
-            info!("Starting stream (preserve: {preserve_count})");
-
-            let Some(session_shared) = Session::get(&sid).await else {
-                let err_msg = format!("Undefined session id `{sid}`");
-                error!("{err_msg}");
-                tx.send(Event::Error(err_msg)).ok();
-                return;
-            };
-
-            info!("Waiting for session lock to read messages...");
-            let db_messages = {
-                let session = session_shared.lock().await;
-                let msgs_res = session.read_messages().await;
-                info!("Messages read. Releasing session lock...");
-
-                match msgs_res {
-                    Ok(msgs) => msgs,
-                    Err(e) => {
-                        error!("Failed to read messages for compression: {e}");
-                        tx.send(Event::Error(e.to_string())).ok();
-                        return;
-                    }
-                }
-            };
-
-            let compress_count = db_messages.len();
-            info!("Total messages read: {compress_count}");
-            if compress_count == 0 {
-                warn!("Nothing to compress, skip");
-                tx.send(Event::Finish).ok();
-                return;
-            }
-
-            let mut messages = Messages::from(db_messages);
-            let to_preserve: Vec<Message> = messages.slice(-(preserve_count as isize)).into();
-
-            let messages = messages.user(vec![compress_prompt.into()]).wrap();
-
-            info!("Sending compression request to LLM...");
-            let mut response = match Completions::try_from(provider_options) {
-                Ok(comp) => match comp.send(messages).await {
-                    Ok(res) => {
-                        info!("Received LLM stream response handle");
-                        res
-                    }
-                    Err(e) => {
-                        error!("Failed to send compression request to LLM: {e}");
-                        tx.send(Event::Error(e.to_string())).ok();
-                        return;
-                    }
-                },
-                Err(e) => {
-                    error!("Failed to prepare LLM completions config: {e}");
-                    tx.send(Event::Error(e.to_string())).ok();
-                    return;
-                }
-            };
-
-            let mut full_compressed_text = String::new();
-            info!("Streaming compressed response chunks from LLM...");
-
-            while let Some(chunk) = response.next().await {
-                match chunk {
-                    Ok(Chunk::Text(text_part)) => {
-                        if tx.send(Event::Answer(text_part.clone())).is_err() {
-                            warn!("Stream receiver dropped by client, aborting compression");
-                            return;
-                        }
-                        full_compressed_text.push_str(&text_part);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!("Error during LLM streaming: {e}");
-                        tx.send(Event::Error(e.to_string())).ok();
-                        return;
-                    }
-                }
-            }
-
-            info!(
-                "LLM stream finished. Length of text: {}",
-                full_compressed_text.len()
-            );
-
-            let compressed_message = Message::assistant(vec![full_compressed_text.into()], vec![]);
-
-            info!("Waiting for session lock to save compressed history...");
-            let save_res = {
-                let mut session = session_shared.lock().await;
-                info!("Acquired session lock. Inserting & shifting DB...");
-                let res = session
-                    .insert_and_shift(compressed_message, to_preserve, compress_count)
-                    .await;
-                info!("DB insert & shift complete. Releasing session lock...");
-                res
-            };
-
-            if let Err(e) = save_res {
-                error!("Failed to update DB with compressed history: {e}");
-                tx.send(Event::Error(e.to_string())).ok();
-                return;
-            }
-
-            tx.send(Event::Finish).ok();
-            info!("Compression finished successfully for session {sid}");
-        }
-        .instrument(current)
-    })
-}
-
 /// Completely clears the session message history
 #[log(sid = %sid)]
 pub async fn handle_session_clear(Paths(sid): Paths<SessionId>) -> Response {
-    if let Some(session_shared) = Session::get(&sid).await {
+    if let Some(session_shared) = Session::get(&sid) {
         info!("Waiting for session lock...");
-        let res = {
-            let mut session = session_shared.lock().await;
-            let clear_res = session.clear().await;
-            clear_res
-        };
+        let res = session_shared.lock().await.clear().await;
 
         if let Err(e) = res {
             error!("Failed to clear session {sid}: {e}");
@@ -283,7 +148,7 @@ pub async fn handle_session_remove(Paths(sid): Paths<SessionId>) -> Response {
 /// Clones user session and returns a new ID.
 #[log(sid = %sid)]
 pub async fn handle_session_clone(Paths(sid): Paths<SessionId>) -> Response {
-    if let Some(session_shared) = Session::get(&sid).await {
+    if let Some(session_shared) = Session::get(&sid) {
         info!("Waiting for session lock...");
         let clone_res = {
             let session = session_shared.lock().await;
@@ -312,12 +177,7 @@ pub async fn handle_session_clone(Paths(sid): Paths<SessionId>) -> Response {
 /// API: Lists active rules (global + local) for a session.
 #[log(sid = %sid)]
 pub async fn handle_session_rules_list(Paths(sid): Paths<SessionId>) -> Response {
-    info!("Looking up Session::get...");
-    let Some(session_shared) = Session::get(&sid).await else {
-        let err_msg = format!("Undefined session id `{sid}`");
-        error!("{err_msg}");
-        return Response::error().text(err_msg);
-    };
+    let session_shared = session!(sid);
 
     info!("Waiting for session lock...");
     let rules_res = {
@@ -349,12 +209,7 @@ pub async fn handle_session_rules_set(
     let SetQuery { id, text } = query.0;
     info!("Setting rule (id: {id:?})...");
 
-    info!("Looking up Session::get...");
-    let Some(session_shared) = Session::get(&sid).await else {
-        let err_msg = format!("Undefined session id `{sid}`");
-        error!("{err_msg}");
-        return Response::error().text(err_msg);
-    };
+    let session_shared = session!(sid);
 
     info!("Waiting for session lock...");
     let save_res = {
@@ -395,12 +250,7 @@ pub async fn handle_session_rules_remove(
     let rule_id = query.0.id;
     info!("Removing rule `{rule_id}`...");
 
-    info!("Looking up Session::get...");
-    let Some(session_shared) = Session::get(&sid).await else {
-        let err_msg = format!("Undefined session id `{sid}`");
-        error!("{err_msg}");
-        return Response::error().text(err_msg);
-    };
+    let session_shared = session!(sid);
 
     info!("Waiting for session lock...");
     let remove_res = {
@@ -433,12 +283,7 @@ pub async fn handle_session_rules_remove(
 pub async fn handle_session_rules_clear(Paths(sid): Paths<SessionId>) -> Response {
     info!("Requesting clear_local_rules...");
 
-    info!("Looking up Session::get...");
-    let Some(session_shared) = Session::get(&sid).await else {
-        let err_msg = format!("Undefined session id `{sid}`");
-        error!("{err_msg}");
-        return Response::error().text(err_msg);
-    };
+    let session_shared = session!(sid);
 
     info!("Waiting for session lock...");
     let clear_res = {

@@ -1,5 +1,8 @@
 //! Helper methods module.
 
+pub mod text;
+pub use text::*;
+
 pub mod info;
 pub use info::*;
 

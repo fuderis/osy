@@ -32,7 +32,7 @@ use prelude::*;
 
 use rigging::{CommandContext, Commands, pkg_meta, widgets::Print};
 
-#[atoman::main]
+#[tokio::main]
 async fn main() -> Result<()> {
     use commands as cmds;
 
@@ -195,7 +195,6 @@ async fn serve(_: CommandContext) -> Result<()> {
         .post("/sessions/{sid}/init", hands::handle_session_init)
         .post("/sessions/{sid}/finish", hands::handle_session_finish)
         .post("/sessions/{sid}/rename", hands::handle_session_rename)
-        .post("/sessions/{sid}/compact", hands::handle_session_compact)
         .post("/sessions/{sid}/clear", hands::handle_session_clear)
         .post("/sessions/{sid}/remove", hands::handle_session_remove)
         .post("/sessions/{sid}/clone", hands::handle_session_clone)

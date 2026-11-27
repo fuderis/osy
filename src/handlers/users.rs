@@ -34,9 +34,8 @@ pub async fn handle_user_facts_list(uid: Paths<u64>, query: Json<ListQuery>) -> 
     let count = query.0.count;
 
     let user = get_user!(*uid);
-    let user_guard = user.read().await;
 
-    match user_guard.load_facts().await {
+    match user.load_facts().await {
         Ok(mut facts) => Response::ok().json({
             if let Some(count) = count {
                 facts.truncate(count);
@@ -56,9 +55,8 @@ pub async fn handle_user_facts_search(uid: Paths<u64>, query: Json<SearchQuery>)
     let SearchQuery { query, limit } = query.0;
 
     let user = get_user!(*uid);
-    let user_guard = user.read().await;
 
-    match user_guard.search_facts(&query, limit).await {
+    match user.search_facts(&query, limit).await {
         Ok(records) => {
             let facts: Vec<_> = records.into_iter().map(|record| record.data).collect();
             Response::ok().json(&facts)
@@ -76,11 +74,10 @@ pub async fn handle_user_facts_set(uid: Paths<u64>, query: Json<SetQuery>) -> Re
     let SetQuery { id, text } = query.0;
 
     let user = get_user!(*uid);
-    let user_guard = user.read().await;
 
     // if fact ID was passed, first delete the old one
     if let Some(ref fact_id) = id {
-        if let Err(e) = user_guard.remove_fact(*fact_id).await {
+        if let Err(e) = user.remove_fact(*fact_id).await {
             error!(
                 "Failed to remove existing fact {fact_id} before overwrite for user {}: {e}",
                 *uid
@@ -89,7 +86,7 @@ pub async fn handle_user_facts_set(uid: Paths<u64>, query: Json<SetQuery>) -> Re
     }
 
     // save fact in DB
-    match user_guard.save_fact(text).await {
+    match user.save_fact(text).await {
         Ok(_) => Response::ok().text("Fact saved successfully"),
         Err(e) => {
             error!("Failed to set fact for user {}: {e}", *uid);
@@ -104,9 +101,8 @@ pub async fn handle_user_facts_remove(uid: Paths<u64>, query: Json<RemoveQuery>)
     let RemoveQuery { id } = query.0;
 
     let user = get_user!(*uid);
-    let user_guard = user.read().await;
 
-    match user_guard.remove_fact(id).await {
+    match user.remove_fact(id).await {
         Ok(_) => Response::ok().text("Fact removed successfully"),
         Err(e) => {
             error!("Failed to remove fact {id} for user {}: {e}", *uid);
@@ -119,9 +115,8 @@ pub async fn handle_user_facts_remove(uid: Paths<u64>, query: Json<RemoveQuery>)
 #[log(uid = %*uid)]
 pub async fn handle_user_facts_clear(uid: Paths<u64>) -> Response {
     let user = get_user!(*uid);
-    let user_guard = user.read().await;
 
-    match user_guard.clear_facts().await {
+    match user.clear_facts().await {
         Ok(_) => Response::ok().text("All facts cleared successfully"),
         Err(e) => {
             error!("Failed to clear facts for user {}: {e}", *uid);
@@ -136,9 +131,8 @@ pub async fn handle_user_rules_list(uid: Paths<u64>, query: Json<ListQuery>) -> 
     let ListQuery { count } = query.0;
 
     let user = get_user!(*uid);
-    let user_guard = user.read().await;
 
-    match user_guard.load_rules().await {
+    match user.load_rules().await {
         Ok(mut rules) => Response::ok().json({
             if let Some(count) = count {
                 rules.truncate(count);
@@ -158,10 +152,9 @@ pub async fn handle_user_rules_set(uid: Paths<u64>, query: Json<SetQuery>) -> Re
     let SetQuery { id, text } = query.0;
 
     let user = get_user!(*uid);
-    let user_guard = user.read().await;
 
     // save the rule as global (`is_global = true`)
-    match user_guard.save_rule(id, text).await {
+    match user.save_rule(id, text).await {
         Ok(rule) => Response::ok().json(&rule),
         Err(e) => {
             error!("Failed to set global rule for user {}: {e}", *uid);
@@ -176,9 +169,8 @@ pub async fn handle_user_rules_remove(uid: Paths<u64>, query: Json<RemoveQuery>)
     let RemoveQuery { id } = query.0;
 
     let user = get_user!(*uid);
-    let user_guard = user.read().await;
 
-    match user_guard.remove_rule(id).await {
+    match user.remove_rule(id).await {
         Ok(true) => Response::ok().text("Global rule removed successfully"),
         Ok(false) => Response::error().text(format!("Rule `{id}` not found")),
         Err(e) => {
@@ -192,9 +184,8 @@ pub async fn handle_user_rules_remove(uid: Paths<u64>, query: Json<RemoveQuery>)
 #[log(uid = %*uid)]
 pub async fn handle_user_rules_clear(uid: Paths<u64>) -> Response {
     let user = get_user!(*uid);
-    let user_guard = user.read().await;
 
-    match user_guard.clear_rules().await {
+    match user.clear_rules().await {
         Ok(_) => Response::ok().text("Global user rules cleared successfully"),
         Err(e) => {
             error!("Failed to clear global rules for user {}: {e}", *uid);

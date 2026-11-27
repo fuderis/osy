@@ -34,12 +34,6 @@ impl ToolQuery<serde_json::Value> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactQuery {
-    #[serde(default)]
-    pub preserve: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetQuery {
     #[serde(default)]
     pub id: Option<u64>,

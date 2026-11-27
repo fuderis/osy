@@ -1,10 +1,11 @@
 use crate::{CommandResult, Id};
 
-use anylm::Bytes;
-use atoman::{Duration, Result};
-use pearce::{Callback, Sender};
+use atoman::Result;
+use pearce::{Bytes, Callback};
 use rigging::widgets::Confirmation;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum Dialog {
@@ -56,18 +57,18 @@ impl Dialog {
     }
 
     /// Universal method for sending any dialogue and waiting for the result.
-    pub async fn dispatch<T>(self, tx: &Sender<Bytes>, timeout: Duration) -> Result<Option<T>>
+    pub async fn dispatch<T>(self, tx: &mpsc::Sender<Bytes>, timeout: Duration) -> Result<Option<T>>
     where
         T: serde::de::DeserializeOwned + Send + 'static,
     {
         let id = self.get_id().to_string();
-        let mut callback = Callback::register(&id).await;
-        tx.send(Event::Dialog(self))?;
+        let mut callback = Callback::register(&id);
+        tx.send(Event::Dialog(self).into()).await?;
 
         use atoman::error::Error;
 
-        let output = atoman::select! {
-            _ = tx.closed() => return Err(Error::from(atoman::channel::ChannelError::ChannelClosed).into()),
+        let output = tokio::select! {
+            _ = tx.closed() => return Err(Error::Custom(format!("Channel is already closed.")).into()),
             res = callback.recv::<T>(timeout) => {
                 res.map_err(|e| Error::Custom(format!("Dialog action failed: {e}")))?
             }
@@ -78,7 +79,7 @@ impl Dialog {
 
     /// Sends script for execution in CLI (with CommandResult waiting).
     pub async fn script(
-        tx: &Sender<Bytes>,
+        tx: &mpsc::Sender<Bytes>,
         code: impl Into<String>,
         timeout: Duration,
     ) -> Result<Option<CommandResult>> {
@@ -94,7 +95,7 @@ impl Dialog {
 
     /// Sends script for execution in CLI (with CommandResult waiting).
     pub async fn sudo_script(
-        tx: &Sender<Bytes>,
+        tx: &mpsc::Sender<Bytes>,
         code: impl Into<String>,
         timeout: Duration,
     ) -> Result<Option<CommandResult>> {
@@ -110,7 +111,7 @@ impl Dialog {
 
     /// Sends confirmation request [y/n].
     pub async fn confirm(
-        tx: &Sender<Bytes>,
+        tx: &mpsc::Sender<Bytes>,
         prompt: impl Into<String>,
         default: Option<Confirmation>,
         timeout: Duration,
@@ -127,7 +128,7 @@ impl Dialog {
 
     /// Sends input prompt.
     pub async fn prompt(
-        tx: &Sender<Bytes>,
+        tx: &mpsc::Sender<Bytes>,
         prompt: impl Into<String>,
         placeholder: Option<String>,
         default: Option<String>,
@@ -147,7 +148,7 @@ impl Dialog {
 
     /// Sends multiline input prompt.
     pub async fn multiline_prompt(
-        tx: &Sender<Bytes>,
+        tx: &mpsc::Sender<Bytes>,
         prompt: impl Into<String>,
         placeholder: Option<String>,
         default: Option<String>,
@@ -167,7 +168,7 @@ impl Dialog {
 
     /// Sends secret input prompt (passwords, tokens, etc.).
     pub async fn secret(
-        tx: &Sender<Bytes>,
+        tx: &mpsc::Sender<Bytes>,
         prompt: impl Into<String>,
         placeholder: Option<String>,
         timeout: Duration,
@@ -184,7 +185,7 @@ impl Dialog {
 
     /// Sends drop‑down menu for selecting from a list.
     pub async fn select(
-        tx: &Sender<Bytes>,
+        tx: &mpsc::Sender<Bytes>,
         prompt: impl Into<String>,
         items: Vec<String>,
         timeout: Duration,
@@ -211,14 +212,26 @@ pub enum Event {
     Finish,
 }
 
-impl Into<String> for Event {
-    fn into(self) -> String {
-        serde_json::to_string(&self).unwrap()
+impl From<Dialog> for Event {
+    fn from(dialog: Dialog) -> Self {
+        Event::Dialog(dialog)
     }
 }
 
-impl Into<Bytes> for Event {
-    fn into(self) -> Bytes {
-        Into::<String>::into(self).into()
+impl From<Dialog> for Bytes {
+    fn from(dialog: Dialog) -> Self {
+        Event::from(dialog).into()
+    }
+}
+
+impl From<Event> for String {
+    fn from(event: Event) -> Self {
+        serde_json::to_string(&event).expect("Event serialization should not fail")
+    }
+}
+
+impl From<Event> for Bytes {
+    fn from(event: Event) -> Self {
+        String::from(event).into()
     }
 }

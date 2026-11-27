@@ -3,22 +3,29 @@
 pub mod session;
 pub use session::Session;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{prelude::*, utils};
 
 use anylm::embeddings::Search;
+use atoman::dashmap::DashMap;
 use cistern::{Context, ContextRecord, Storage, gen_id};
 use osy_share::{SessionId, SessionMetadata, UserFact, UserMetadata, UserRule};
+use tokio::sync::OnceCell;
 
-/// User states map {uid => state}.
-static USER_STATES: SharedMap<u64, UserState> = SharedMap::new();
+/// Lazily initialized user slot (a slot is created atomically, the state is built once).
+type UserSlot = Arc<OnceCell<Arc<UserState>>>;
+
+/// Active users map {uid => slot}.
+static USERS: SharedMap<u64, UserSlot> = SharedMap::new();
 
 const FACTS_TABLE_NAME: &str = "facts";
 const RULES_TABLE_NAME: &str = "rules";
 
 /// User state.
+///
+/// Shared as `Arc<UserState>` without any outer lock: all fields are either immutable
+/// or have their own interior synchronization.
 pub struct UserState {
     /// Unique user identifier.
     pub id: u64,
@@ -27,48 +34,92 @@ pub struct UserState {
     /// Vector database for user facts.
     pub rag_db: Arc<Context>,
     /// Active user sessions.
-    pub sessions: HashMap<SessionId, session::SharedSession>,
+    sessions: DashMap<SessionId, session::SharedSession>,
+    /// Serializes read-modify-write cycles of the user metadata.
+    meta_lock: Mutex<()>,
+    /// Serializes initialization of user sessions.
+    init_lock: Mutex<()>,
 }
 
 impl UserState {
-    /// Returns user state or initializes it.
-    pub async fn get_or_init(id: u64) -> Result<SharedItem<UserState>> {
-        // search at active users
-        if let Some(user) = USER_STATES.get(&id).await {
+    /// Returns active user state (without initializing it).
+    pub fn get(id: u64) -> Option<Arc<UserState>> {
+        USERS.get(&id).and_then(|slot| slot.get().cloned())
+    }
+
+    /// Returns user state or initializes it (concurrent callers share a single initialization).
+    pub async fn get_or_init(id: u64) -> Result<Arc<UserState>> {
+        // fast path: active user
+        if let Some(user) = Self::get(id) {
             return Ok(user);
         }
 
-        // initializing user
+        // take (or create) the slot, the map reference is dropped at the end of the statement
+        let slot: UserSlot = USERS.entry(id).or_default().clone();
+
+        let user = slot
+            .get_or_try_init(|| async { Self::connect(id).await.map(Arc::new) })
+            .await?;
+
+        Ok(user.clone())
+    }
+
+    /// Opens user databases.
+    async fn connect(id: u64) -> Result<Self> {
         let user_base = path!("$share$/users/{id}");
-        let kv_dir = user_base.join("userdata");
-        let kv_db = Arc::new(Storage::connect(kv_dir).await?);
 
-        let context_dir = user_base.join("context");
-        let rag_db = Arc::new(Context::connect(context_dir).await?);
+        let kv_db = Arc::new(Storage::connect(user_base.join("userdata")).await?);
+        let rag_db = Arc::new(Context::connect(user_base.join("context")).await?);
 
-        let state = Self {
+        Ok(Self {
             id,
             kv_db,
             rag_db,
-            sessions: HashMap::new(),
-        };
-
-        // insert to global state
-        USER_STATES.insert(id, state).await;
-
-        // return atomic reference to state
-        USER_STATES.get(&id).await.ok_or_else(|| {
-            Error::Custom("Failed to acquire user state lock after initialization".into()).into()
+            sessions: DashMap::new(),
+            meta_lock: Mutex::new(()),
+            init_lock: Mutex::new(()),
         })
+    }
+
+    /// Returns true if this state is still the registered one (was not evicted).
+    fn is_live(&self) -> bool {
+        USERS
+            .get(&self.id)
+            .and_then(|slot| slot.get().map(|u| std::ptr::eq(Arc::as_ptr(u), self)))
+            .unwrap_or(false)
+    }
+
+    /// Frees user state from memory if it has no active sessions.
+    fn evict_if_idle(id: u64) {
+        USERS.remove_if(&id, |_, slot| {
+            slot.get().is_some_and(|user| user.sessions.is_empty())
+        });
+    }
+
+    /// Returns active session of this user.
+    pub fn session(&self, sid: &SessionId) -> Option<session::SharedSession> {
+        self.sessions.get(sid).map(|s| s.value().clone())
+    }
+
+    /// Updates user metadata atomically (read-modify-write under the metadata lock).
+    pub async fn update_metadata<R>(&self, f: impl FnOnce(&mut UserMetadata) -> R) -> Result<R> {
+        let _guard = self.meta_lock.lock().await;
+
+        let mut meta = self.load_metadata().await?.unwrap_or_default();
+        let res = f(&mut meta);
+        self.save_metadata(&meta).await?;
+
+        Ok(res)
     }
 
     /// Returns list of user sessions metadata (ordered by freshness).
     pub async fn list_sessions(id: u64, limit: usize) -> Result<Vec<SessionMetadata>> {
-        let session_ids = {
-            let user = Self::get_or_init(id).await?;
-            let guard = user.read().await;
-            guard.load_metadata().await?.unwrap_or_default().sessions
-        };
+        let session_ids = Self::get_or_init(id)
+            .await?
+            .load_metadata()
+            .await?
+            .unwrap_or_default()
+            .sessions;
 
         let mut session_ids = session_ids;
         session_ids.reverse();
@@ -79,7 +130,7 @@ impl UserState {
         let mut result = Vec::with_capacity(session_ids.len());
         for sid in session_ids {
             // check active session in memory to avoid redundant DB reads
-            if let Some(session) = session::Session::get(&sid).await {
+            if let Some(session) = session::Session::get(&sid) {
                 let meta = session.lock().await.metadata.clone();
                 result.push(meta);
             } else {
@@ -133,18 +184,19 @@ impl UserState {
         Ok(meta.last_session)
     }
 
-    /// Removes user sessions.
-    pub async fn remove_session(&mut self, session_id: &SessionId) -> Result<()> {
+    /// Removes user session (from memory, metadata and session database).
+    pub async fn remove_session(&self, session_id: &SessionId) -> Result<()> {
         // remove from memory
         self.sessions.remove(session_id);
 
         // remove from metadata
-        let mut user_meta = self.load_metadata().await?.unwrap_or_default();
-        user_meta.sessions.retain(|s| s != session_id);
-        if user_meta.last_session == Some(*session_id) {
-            user_meta.last_session = user_meta.sessions.last().copied();
-        }
-        self.save_metadata(&user_meta).await?;
+        self.update_metadata(|meta| {
+            meta.sessions.retain(|s| s != session_id);
+            if meta.last_session == Some(*session_id) {
+                meta.last_session = meta.sessions.last().copied();
+            }
+        })
+        .await?;
 
         // clear session database
         let session_table_name = str!(session_id);

@@ -1,9 +1,10 @@
 use crate::ToolQuery;
 
 use anylm::api::Tool;
-use pearce::stream::{Bytes, Sender};
+use pearce::stream::Bytes;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use tokio::sync::mpsc;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Sync + Send>>;
 
@@ -35,7 +36,7 @@ pub trait SkillExt {
 
     fn tool_call(
         &self,
-        tx: Sender<Bytes>,
+        tx: mpsc::Sender<Bytes>,
         tool: String,
         payload: ToolQuery<JsonValue>,
     ) -> impl Future<Output = Result<()>> + Send;

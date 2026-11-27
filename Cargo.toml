@@ -16,28 +16,8 @@
 [package]
 name = "osy"
 description = "AI-Powered Toolkit Kernel (Experimental)."
-version = "0.26.0"
+version = "0.27.0"
 edition = "2024"
-
-[dependencies]
-osy-share.workspace = true
-atoman.workspace = true
-macron.workspace = true
-rigging.workspace = true
-pearce.workspace = true
-anylm.workspace = true
-cistern.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-chrono.workspace = true
-boa_engine.workspace = true
-libc.workspace = true
-rand.workspace = true
-regex.workspace = true
-whatlang.workspace = true
-sysinfo.workspace = true
-heck.workspace = true
-include_dir.workspace = true
 
 [workspace]
 members = ["crates/share", "crates/skill", "agents/*"]
@@ -48,23 +28,19 @@ resolver = "3"
 osy-share.path = "crates/share"
 osy-skill.path = "crates/skill"
 
-atoman = { version = "0.14.2", features = ["full"] }
-macron = { version = "0.8.0", features = ["full"] }
-rigging = { version = "0.6.0", features = ["full"] }
-pearce = { version = "0.9.0", features = ["full"] }
-anylm = { version = "0.6.0", features = ["full"] }
-cistern = { version = "0.5.0", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }
+atoman = { version = "0.15.1", features = ["full"] }
+macron = { version = "0.8.1", features = ["full"] }
+rigging = { version = "0.7.0", features = ["full"] }
+pearce = { version = "0.11.0", features = ["full"] }
+anylm = { version = "0.7.0", features = ["full"] }
+cistern = { version = "0.6.0", features = ["full"] }
 
-# atoman = { path = "../../crates/atoman", features = ["full"] }
-# rigging = { path = "../../crates/rigging", features = ["full"] }
-# pearce = { path = "../../crates/pearce", features = ["full"] }
-# anylm = { path = "../../crates/anylm", features = ["full"] }
-# cistern = { path = "../../crates/cistern", features = ["full"] }
-
-boa_engine = "0.21.1"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 toml = "1.0.0"
+
+boa_engine = "0.21.1"
 chrono = { version = "0.4.42", features = ["serde"] }
 regex = "1.12.2"
 rand = "0.10.1"
@@ -79,3 +55,27 @@ include_dir = "0.7.4"
 syn = { version = "2.0", features = ["full", "extra-traits"] }
 quote = "1.0"
 proc-macro2 = "1.0"
+
+[dependencies]
+osy-share.workspace = true
+
+tokio.workspace = true
+
+rigging.workspace = true
+pearce.workspace = true
+anylm.workspace = true
+cistern.workspace = true
+
+atoman.workspace = true
+macron.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+boa_engine.workspace = true
+libc.workspace = true
+rand.workspace = true
+regex.workspace = true
+whatlang.workspace = true
+sysinfo.workspace = true
+heck.workspace = true
+include_dir.workspace = true

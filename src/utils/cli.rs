@@ -33,7 +33,7 @@ pub async fn select_session(
                 .iter()
                 .map(|s| {
                     if let Some(t) = &s.title {
-                        format!("{} — {t}", s.session_id)
+                        format!("[{}] {t}", s.session_id)
                     } else {
                         s.session_id.to_string()
                     }

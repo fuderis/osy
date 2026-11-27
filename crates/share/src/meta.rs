@@ -19,10 +19,8 @@ pub struct SessionMetadata {
     pub session_id: SessionId,
     /// Session title.
     pub title: Option<String>,
-    /// Total session messages count.
+    /// Total message pairs count (`User -> Assistant`).
     pub message_count: usize,
-    /// Point of the last compressed segment.
-    pub compressed_until: usize,
 }
 
 /// User session info.

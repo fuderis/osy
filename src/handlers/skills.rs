@@ -10,8 +10,8 @@ use anylm::{
     api::{Content, Message, Messages, Tool},
     completions::{Chunk, Completions},
 };
-use atoman::task::JoinSet;
 use osy_share::{Event, HandleQuery, SessionId, SessionInfo};
+use tokio::task::JoinSet;
 
 /// API: Handles skill query.
 pub async fn handle_skill_query(
@@ -19,30 +19,43 @@ pub async fn handle_skill_query(
     query: Json<HandleQuery>,
 ) -> Response {
     let (sid, skill_name) = paths.0;
-    let HandleQuery { current_path, message } = query.0;
+    let HandleQuery {
+        current_path,
+        message,
+    } = query.0;
 
     Response::ok().stream(move |tx| async move {
         let result = match Session::read(sid).await {
             Ok((session, _messages)) => {
-                if let Err(e) = session.lock().await.write_message(message.clone()).await {
-                    error!("[handle_skill_query{{sid={sid}}}] Failed to write user message: {e}");
-                    Err(e)
-                } else {
-                    let session_info = session.lock().await.info.clone();
+                let session_info = session.lock().await.info.clone();
 
-                    match handle_skill(tx.clone(), session_info, &skill_name, message, current_path, true).await {
-                        Ok(result_text) => {
-                            let assistant_msg = Message::assistant(vec![result_text.clone().into()],vec![]);
-                            if let Err(e) = session.lock().await.write_message(assistant_msg).await {
-                                error!("[handle_skill_query{{sid={sid}}}] Failed to write assistant message: {e}");
-                                Err(e)
-                            } else {
-                                let _ = tx.send(Event::Finish);
-                                Ok(())    
-                            }
+                match handle_skill(
+                    tx.clone(),
+                    session_info,
+                    &skill_name,
+                    message.clone(),
+                    current_path,
+                    true,
+                )
+                .await
+                {
+                    Ok(result_text) => {
+                        let assistant_msg = Message::assistant(vec![result_text.clone().into()], vec![]);
+                        let pair = (message, assistant_msg);
+                        if let Err(e) = session
+                            .lock()
+                            .await
+                            .write_messages(pair)
+                            .await
+                        {
+                            error!("[handle_skill_query{{sid={sid}}}] Failed to write turn pair: {e}");
+                            Err(e)
+                        } else {
+                            let _ = tx.send(Event::Finish.into()).await;
+                            Ok(())
                         }
-                        Err(e) => Err(e),
-                    }    
+                    }
+                    Err(e) => Err(e),
                 }
             }
             Err(e) => Err(e),
@@ -50,9 +63,9 @@ pub async fn handle_skill_query(
 
         if let Err(e) = result {
             error!("[handle_skill_query{{sid={sid}}}] Execution failed: {e}");
-            tx.send(Event::Error(e.to_string())).ok();
+            tx.send(Event::Error(e.to_string()).into()).await.ok();
         }
-    })
+    }, 1024)
 }
 
 /// Performs agent's skill (creates the context, launches the LLM cycle, self-healing and distribution of sub-tools).
@@ -63,7 +76,7 @@ pub async fn handle_skill(
     skill_name: &str,
     message: Message,
     current_path: Option<PathBuf>,
-    stream_answer: bool
+    stream_answer: bool,
 ) -> Result<String> {
     let Some(agent) = Manager::get_by_skill(skill_name).await else {
         return Err(
@@ -72,17 +85,15 @@ pub async fn handle_skill(
     };
 
     // extracting agent metadata
-    let agent_guard = agent.read().await;
-    let sock_path = agent_guard.metadata.sock_path.to_string_lossy().to_string();
-    let agent_name = agent_guard.metadata.name.clone();
-    let Some(skill) = agent_guard.metadata.skills.get(skill_name) else {
+    let sock_path = agent.metadata.sock_path.to_string_lossy().to_string();
+    let agent_name = agent.metadata.name.clone();
+    let Some(skill) = agent.metadata.skills.get(skill_name) else {
         return Err(Error::Custom(format!(
             "Failed to get `{skill_name}` skill metadata, aborting..."
         ))
         .into());
     };
     let agent_skill_prompt = skill.prompt.trim().to_owned();
-    drop(agent_guard);
 
     // loading agent's list of tools and combining with skill basic tools
     let client = Client::ipc(&sock_path);
@@ -111,7 +122,7 @@ pub async fn handle_skill(
             .replace('\n', " ")
     );
     info!("{msg}");
-    tx.send(Event::Thinking(msg)).ok();
+    tx.send(Event::Thinking(msg).into()).await.ok();
 
     let cfg = Config::get();
     let provider_options = cfg.llm.skill_options();
@@ -180,7 +191,9 @@ pub async fn handle_skill(
                     match chunk {
                         Ok(Chunk::Text(text_part)) => {
                             if stream_answer {
-                                if let Err(e) = tx.send(Event::Answer(text_part.clone())) {
+                                if let Err(e) =
+                                    tx.send(Event::Answer(text_part.clone()).into()).await
+                                {
                                     warn!("[handle_skill] Failed to stream chunk to client: {e}");
                                 }
                             }
@@ -202,9 +215,13 @@ pub async fn handle_skill(
                         warn!(
                             "Error reading stream from agent `{agent_name}`. Retrying ({retry_count}/{max_retries}): {err}"
                         );
-                        tx.send(Event::Thinking(format!(
-                            "Stream error. Retrying {agent_name} agent execution..."
-                        )))?;
+                        tx.send(
+                            Event::Thinking(format!(
+                                "Stream error. Retrying {agent_name} agent execution..."
+                            ))
+                            .into(),
+                        )
+                        .await?;
 
                         agent_messages.lock().await.add_user(vec![
                             format!("An error occurred during output generation: {err}. Please try again using tools.").into()
@@ -225,9 +242,13 @@ pub async fn handle_skill(
                         warn!(
                             "Agent `{agent_name}` returned empty response and no tool calls. Retrying ({retry_count}/{max_retries})..."
                         );
-                        tx.send(Event::Thinking(format!(
-                            "Agent {agent_name} returned empty response. Retrying task..."
-                        )))?;
+                        tx.send(
+                            Event::Thinking(format!(
+                                "Agent {agent_name} returned empty response. Retrying task..."
+                            ))
+                            .into(),
+                        )
+                        .await?;
 
                         agent_messages.lock().await.add_user(vec![
                             "You did not call any tools. Please execute the requested task using tools now.".into()
@@ -248,9 +269,13 @@ pub async fn handle_skill(
                     warn!(
                         "Failed to send completions request for agent `{agent_name}` ({retry_count}/{max_retries}): {e}"
                     );
-                    tx.send(Event::Thinking(format!(
-                        "Request error. Retrying {agent_name} agent execution..."
-                    )))?;
+                    tx.send(
+                        Event::Thinking(format!(
+                            "Request error. Retrying {agent_name} agent execution..."
+                        ))
+                        .into(),
+                    )
+                    .await?;
 
                     agent_messages.lock().await.add_user(vec![
                         format!("Failed to process request due to error: {e}. Please attempt to execute the task again.").into()
@@ -291,10 +316,14 @@ pub async fn handle_skill(
                     match tool_call.func.name.as_str() {
                         "js_eval" => {
                             let eval: EvalAction = tool_call.parse_args()?;
-                            tx.send(Event::Thinking(format!(
-                                "Executing JavaScript code: {:80}...",
-                                &eval.code
-                            )))
+                            tx.send(
+                                Event::Thinking(format!(
+                                    "Executing JavaScript code: {:80}...",
+                                    &eval.code
+                                ))
+                                .into(),
+                            )
+                            .await
                             .ok();
                             let result = skills::handle_eval(eval).await?;
                             Ok((tool_call.id, format!("JS Result:\n{result}")))
@@ -302,22 +331,28 @@ pub async fn handle_skill(
                         "remember_fact" => {
                             let act: RememberFact = tool_call.parse_args()?;
                             let user = UserState::get_or_init(session_info.id.user_id).await?;
-                            let user_guard = user.read().await;
-                            let res_msg = skills::handle_remember_fact(&user_guard, act).await?;
-                            tx.send(Event::Thinking(res_msg.clone())).ok();
+                            let res_msg = skills::handle_remember_fact(&user, act).await?;
+                            tx.send(Event::Thinking(res_msg.clone()).into()).await.ok();
                             Ok((tool_call.id, format!("Memory Operation Result:\n{res_msg}")))
                         }
                         "search_fact" => {
                             let act: SearchFact = tool_call.parse_args()?;
                             let user = UserState::get_or_init(session_info.id.user_id).await?;
-                            let user_guard = user.read().await;
-                            let res_msg = skills::handle_search_fact(&user_guard, act).await?;
-                            tx.send(Event::Thinking(res_msg.clone())).ok();
+                            let res_msg = skills::handle_search_fact(&user, act).await?;
+                            tx.send(Event::Thinking(res_msg.clone()).into()).await.ok();
                             Ok((tool_call.id, format!("Memory Operation Result:\n{res_msg}")))
                         }
                         _ => {
-                            super::handle_tool(client, sock_path, agent_name, skill_name, tool_call, current_path, tx)
-                                .await
+                            super::handle_tool(
+                                client,
+                                sock_path,
+                                agent_name,
+                                skill_name,
+                                tool_call,
+                                current_path,
+                                tx,
+                            )
+                            .await
                         }
                     }
                 }
@@ -327,7 +362,7 @@ pub async fn handle_skill(
 
         // collecting results of work of the sub-tools
         loop {
-            atoman::select! {
+            tokio::select! {
                 _ = tx.closed() => {
                     sub_workers.abort_all();
                     return Err(Error::ConnectionClosed.into());
