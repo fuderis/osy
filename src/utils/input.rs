@@ -1,7 +1,8 @@
 use crate::prelude::*;
 
 use osy_share::{
-    ListQuery, RemoveQuery, RenameQuery, SearchQuery, SessionId, SetQuery, UserFact, UserRule,
+    FactProbe, ListQuery, RemoveQuery, RenameQuery, SearchQuery, SessionId, SetQuery, UserFact,
+    UserRule,
 };
 use rigging::{Stylize, style::Align};
 
@@ -148,6 +149,8 @@ pub async fn render_input(
                         ("facts list [count]", "List stored facts"),
                         ("facts add <fact>", "Save a new fact (alias: /remember)"),
                         ("facts search <query>", "Search stored facts"),
+                        ("facts probe <query>", "Search with scores (tune thresholds)"),
+                        ("facts reindex", "Re-embed all facts (after model change)"),
                         ("facts remove <id>", "Remove fact by ID (alias: /forget)"),
                         ("facts clear", "Purge all facts"),
                         (
@@ -318,6 +321,56 @@ pub async fn render_input(
                         continue;
                     }
 
+                    "probe" => {
+                        if payload.is_empty() {
+                            render_msg("Usage: /facts probe <query>").await?;
+                            continue;
+                        }
+                        let endpoint = format!("{base_url}/users/{}/facts/probe", sid.user_id);
+                        let query = SearchQuery {
+                            query: payload,
+                            limit: Some(10),
+                        };
+
+                        let content = match send_post(client, &endpoint, Some(&query)).await {
+                            Ok(res) => match res.json::<Vec<FactProbe>>().await {
+                                Ok(hits) if hits.is_empty() => "Nothing found.".to_string(),
+                                Ok(hits) => format!(
+                                    "Hits (no thresholds; sim = cosine, lex = word match):\n{}",
+                                    hits.iter()
+                                        .map(|h| format!(
+                                            "* score {:.2} | sim {} | lex {:.2} | [`{}`] {}",
+                                            h.score,
+                                            h.similarity
+                                                .map(|s| format!("{s:.2}"))
+                                                .unwrap_or_else(|| "-".into()),
+                                            h.lexical,
+                                            h.id,
+                                            h.text
+                                        ))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                ),
+                                Err(e) => format!("Failed to parse JSON response: {e}"),
+                            },
+                            Err(err) => err,
+                        };
+
+                        render_msg(content).await?;
+                        continue;
+                    }
+
+                    "reindex" => {
+                        let endpoint = format!("{base_url}/users/{}/facts/reindex", sid.user_id);
+                        let msg = match send_post::<()>(client, &endpoint, None).await {
+                            Ok(res) => res.text().await.unwrap_or_default(),
+                            Err(err) => err,
+                        };
+
+                        render_msg(msg).await?;
+                        continue;
+                    }
+
                     "clear" | "clean" => {
                         let endpoint = format!("{base_url}/users/{}/facts/clear", sid.user_id);
                         let msg = match send_post::<()>(client, &endpoint, None).await {
@@ -331,7 +384,7 @@ pub async fn render_input(
 
                     _ => {
                         render_msg(
-                            "Unknown facts subcommand. Available: list, add, remove, search, clear",
+                            "Unknown facts subcommand. Available: list, add, remove, search, probe, reindex, clear",
                         )
                         .await?;
                         continue;

@@ -7,15 +7,22 @@ use crate::{
 };
 
 use anylm::{
-    api::{Content, Message, Messages, Visibility},
+    api::{Content, Message, Messages, Role, Visibility},
     completions::{Chunk, Completions},
 };
-use osy_share::{Dialog, Event, HandleQuery, Id};
+use osy_share::{Dialog, Event, HandleQuery, Id, UserRule};
 use pearce::Callback;
 use rigging::widgets::Confirmation;
 use tokio::task::JoinSet;
 
-const DIALOG_MAP_MAX_CHARS: usize = 160;
+/// Memory tool call collected while the plan is streamed (executed only after the plan is valid).
+enum MemoryCall {
+    Remember(RememberFact),
+    Search(SearchFact),
+    History(ReadHistory),
+    /// The model called a tool that does not exist (it must be told, not ignored).
+    Unknown(String),
+}
 
 /// API: User query handler.
 pub async fn handle_user_query(paths: Paths<SessionId>, query: Json<HandleQuery>) -> Response {
@@ -29,10 +36,12 @@ pub async fn handle_user_query(paths: Paths<SessionId>, query: Json<HandleQuery>
         move |tx| async move {
             let result = async {
                 let session = Session::require(&sid)?;
-                let last_pair = session.lock().await.read_last_pair().await?;
+
+                let preserve_pairs = Config::get().execution.preserve_pairs;
+                let last_pairs = session.lock().await.read_last_pairs(preserve_pairs).await?;
 
                 let mut initial_msgs = Messages::new();
-                if let Some((prev_user, prev_assistant)) = last_pair {
+                for (prev_user, prev_assistant) in last_pairs {
                     initial_msgs.add_message(prev_user);
                     initial_msgs.add_message(prev_assistant);
                 }
@@ -47,6 +56,7 @@ pub async fn handle_user_query(paths: Paths<SessionId>, query: Json<HandleQuery>
                     Some(message),
                     current_path,
                     0,
+                    None,
                 )
                 .await
             }
@@ -62,6 +72,12 @@ pub async fn handle_user_query(paths: Paths<SessionId>, query: Json<HandleQuery>
 }
 
 /// Handles user query with direct parallel tool execution and self-healing.
+///
+/// Healing principles:
+/// * LLM/transport errors are retried with a pause (counters protect from endless loops);
+/// * errors of tools, skills and JS become tool results, so the model fixes the call itself
+///   and tasks that already succeeded are never executed twice;
+/// * only when the plan itself cannot be produced the user is asked whether to retry.
 #[async_recursion]
 #[log(sid = %sid)]
 async fn handle_query(
@@ -73,21 +89,32 @@ async fn handle_query(
     root_user_msg: Option<Message>,
     current_path: Option<PathBuf>,
     iteration: usize,
+    facts_cache: Option<String>,
 ) -> Result<()> {
     info!("Processing the user query (iteration {iteration})...");
 
     let cfg = Config::get();
     let provider_options = &cfg.llm.assist_options();
-    let assist_prompt = &cfg.llm.assist_prompt();
     let exec_options = &cfg.execution;
+    let ctx_options = &cfg.context;
+
+    let max_iterations = exec_options.max_iterations.max(1);
+    // the last round is made without tools: the model must report what it has
+    let last_round = max_iterations > 1 && iteration + 1 >= max_iterations;
+
+    // facts are searched once per user query (by the user's own words) and reused by control rounds
+    let mut facts_cache = facts_cache;
 
     // loop repeats the CURRENT iteration in case of an error
     'iteration_loop: loop {
-        // 1. RAG, Rules & Session Dialog Map
-        let session_guard = session.lock().await;
+        // 1. Rules, Session Dialog Map & RAG facts
+        let mut session_guard = session.lock().await;
         let base_system_prompt = utils::system_prompt(&session_guard.info, &cfg);
 
-        let dialog_map_prompt = match session_guard.dialog_map(DIALOG_MAP_MAX_CHARS).await {
+        let dialog_map_prompt = match session_guard
+            .dialog_map(ctx_options.dialog_map_chars, ctx_options.dialog_map_turns)
+            .await
+        {
             Ok(map) => map,
             Err(e) => {
                 error!("[DialogMap] Failed to build session dialog map: {e}");
@@ -95,112 +122,99 @@ async fn handle_query(
             }
         };
 
-        let mut facts_prompt = String::new();
-        let mut rules_prompt = String::new();
-
-        match session_guard.load_rules().await {
-            Ok(rules) => {
-                if !rules.is_empty() {
-                    rules_prompt
-                        .push_str("MANDATORY RULES & PREFERENCES (STRICTLY FOLLOW THEM):\n");
-                    for rule in rules {
-                        let scope = if rule.is_global { "Global" } else { "Local" };
-                        rules_prompt.push_str(&format!(
-                            "  * [ID: {}, Scope: {}] {}\n",
-                            rule.id, scope, rule.text
-                        ));
-                    }
-                }
+        let rules_prompt = match session_guard.load_rules().await {
+            Ok(rules) => build_rules_prompt(rules),
+            Err(e) => {
+                error!("[Rules] Failed to load session rules: {e}");
+                String::new()
             }
-            Err(e) => error!("[Rules] Failed to load session rules: {e}"),
-        }
+        };
         drop(session_guard);
 
-        let user_text = message.extract_texts().join("\n\n");
-        if !user_text.trim().is_empty() {
-            match {
-                let user = UserState::get_or_init(sid.user_id).await?;
-                let limit = Config::get().context.search_limit;
-                user.search_facts(&user_text, Some(limit)).await
-            } {
-                Ok(facts) if !facts.is_empty() => {
-                    facts_prompt.push_str("LOADED USER FACTS (USE THEM WHEN NECESSARY):\n");
-                    for record in facts {
-                        facts_prompt
-                            .push_str(&format!("  * [ID: {}] {}\n", record.id, record.data.text));
-                    }
-                }
-                Err(e) => error!("[Facts] Failed to search facts in LanceDB: {e}"),
-                _ => {}
-            }
+        if facts_cache.is_none() {
+            let root_text = root_user_msg
+                .as_ref()
+                .unwrap_or(&message)
+                .extract_texts()
+                .join("\n\n");
+            facts_cache = Some(load_facts_prompt(sid, &root_text).await);
         }
+        let facts_prompt = facts_cache.clone().unwrap_or_default();
 
-        // 2. Preparing the context:
-        //    1) Dialog map at the very top as a system anchor
-        //    2) Previous turn pair & current turn steps from `raw_messages`
-        //    3) System prompt (base + rules + facts + skills) before the latest message
-        let raw_messages = messages.lock().await.messages.clone();
+        // 2. Preparing the context. Stable parts go first (better for provider prompt caching):
+        //    1) [system] assistant prompt + skills + rules + dialog map
+        //    2) previous turn pair & steps of the current turn (WITHOUT old system blocks:
+        //       they are rebuilt on every iteration, otherwise they pile up)
+        //    3) [system] base prompt (OS, time) + facts
+        //    4) the latest message
+        let raw_messages: Vec<Message> = messages
+            .lock()
+            .await
+            .messages
+            .iter()
+            .filter(|m| m.role != Role::System)
+            .cloned()
+            .collect();
 
-        let system_body = [base_system_prompt, rules_prompt, facts_prompt]
-            .into_iter()
-            .filter(|s| !s.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n---\n");
+        let static_prompt = cfg
+            .llm
+            .assist_prompt()
+            .replace("{AGENTS_LIST}", &Manager::agents_doc().await);
+        let top_system = join_blocks([static_prompt, rules_prompt, dialog_map_prompt]);
+        let tail_system = join_blocks([base_system_prompt, facts_prompt]);
 
-        let mut builder = Messages::new();
-
-        if !dialog_map_prompt.trim().is_empty() {
-            builder = builder.message(
-                Message::system(vec![dialog_map_prompt.into()]).visibility(Visibility::Internal),
-            );
-        }
+        let mut builder = Messages::new()
+            .message(Message::system(vec![top_system.into()]).visibility(Visibility::Internal));
 
         for m in raw_messages {
             builder = builder.message(m);
         }
 
-        builder = builder.message(
-            Message::system(vec![
-                system_body.into(),
-                assist_prompt
-                    .replace("{AGENTS_LIST}", &Manager::agents_doc().await)
-                    .into(),
-            ])
-            .visibility(Visibility::Internal),
-        );
+        if !tail_system.trim().is_empty() {
+            builder = builder.message(
+                Message::system(vec![tail_system.into()]).visibility(Visibility::Internal),
+            );
+        }
 
         let messages = builder.message(message.clone()).wrap();
 
-        warn!("CONTEXT MESSAGES: {:#?}", messages.lock().await); // DEBUG
+        info!(
+            "Context prepared: {} messages",
+            messages.lock().await.messages.len()
+        );
 
-        let mut agent_tasks = vec![];
+        let mut agent_tasks: Vec<SkillAction> = vec![];
         let mut evals_list = vec![];
-        let mut memory_results = vec![];
+        let mut pending_memory: Vec<(String, MemoryCall)> = vec![];
         let mut final_text_response = str!();
 
-        let mut retry_count = 0;
+        let mut retry_count = 0; // consecutive failures (the planning is retried in place)
+        let mut total_errors = 0;
         let max_retries = exec_options.max_retries.max(1);
+        let max_total_errors = exec_options.max_total_errors.max(max_retries);
 
         // LLM Planning cycle
         let planning_res: Result<()> = loop {
             agent_tasks.clear();
             evals_list.clear();
-            memory_results.clear();
+            pending_memory.clear();
             let mut text_response = str!();
 
             if tx.is_closed() {
                 return Err(Error::ConnectionClosed.into());
             }
 
-            let mut response = match Completions::try_from(provider_options.clone())?
-                .tools(Manager::basic_tools().await)
-                .send(messages.clone())
-                .await
-            {
+            let mut completions = Completions::try_from(provider_options.clone())?;
+            if !last_round {
+                completions = completions.tools(Manager::basic_tools().await);
+            }
+
+            let mut response = match completions.send(messages.clone()).await {
                 Ok(res) => res,
                 Err(e) => {
                     retry_count += 1;
-                    if retry_count < max_retries {
+                    total_errors += 1;
+                    if retry_count < max_retries && total_errors <= max_total_errors {
                         warn!(
                             "Failed to send query completions request ({retry_count}/{max_retries}): {e}"
                         );
@@ -210,6 +224,7 @@ async fn handle_query(
                             ])
                             .visibility(Visibility::Internal),
                         );
+                        utils::backoff(retry_count).await;
                         continue;
                     } else {
                         break Err(e.into());
@@ -226,6 +241,9 @@ async fn handle_query(
                     Ok(Chunk::Text(text_part)) => {
                         text_response.push_str(&text_part);
                         tx.send(Event::Answer(text_part).into()).await?;
+                    }
+                    Ok(Chunk::Tool(_)) if last_round => {
+                        warn!("Tool call ignored: no tools on the last round");
                     }
                     Ok(Chunk::Tool(tool_call)) => match tool_call.func.name.as_ref() {
                         "use_skill" => match tool_call.parse_args::<SkillAction>() {
@@ -247,16 +265,9 @@ async fn handle_query(
                             }
                         },
                         "remember_fact" => match tool_call.parse_args::<RememberFact>() {
-                            Ok(act) => match {
-                                let user = UserState::get_or_init(sid.user_id).await?;
-                                skills::handle_remember_fact(&user, act).await
-                            } {
-                                Ok(res_msg) => memory_results.push((tool_call.id, res_msg)),
-                                Err(e) => {
-                                    chunk_error = Some(format!("Failed to save fact: {e}").into());
-                                    break;
-                                }
-                            },
+                            Ok(act) => {
+                                pending_memory.push((tool_call.id, MemoryCall::Remember(act)))
+                            }
                             Err(e) => {
                                 chunk_error =
                                     Some(format!("Failed to parse remember_fact: {e}").into());
@@ -264,17 +275,7 @@ async fn handle_query(
                             }
                         },
                         "search_fact" => match tool_call.parse_args::<SearchFact>() {
-                            Ok(act) => match {
-                                let user = UserState::get_or_init(sid.user_id).await?;
-                                skills::handle_search_fact(&user, act).await
-                            } {
-                                Ok(res_msg) => memory_results.push((tool_call.id, res_msg)),
-                                Err(e) => {
-                                    chunk_error =
-                                        Some(format!("Failed to search facts: {e}").into());
-                                    break;
-                                }
-                            },
+                            Ok(act) => pending_memory.push((tool_call.id, MemoryCall::Search(act))),
                             Err(e) => {
                                 chunk_error =
                                     Some(format!("Failed to parse search_fact: {e}").into());
@@ -282,24 +283,20 @@ async fn handle_query(
                             }
                         },
                         "read_history" => match tool_call.parse_args::<ReadHistory>() {
-                            Ok(act) => match {
-                                let user = UserState::get_or_init(sid.user_id).await?;
-                                skills::handle_read_history(&user, act).await
-                            } {
-                                Ok(res_msg) => memory_results.push((tool_call.id, res_msg)),
-                                Err(e) => {
-                                    chunk_error =
-                                        Some(format!("Failed to read history: {e}").into());
-                                    break;
-                                }
-                            },
+                            Ok(act) => {
+                                pending_memory.push((tool_call.id, MemoryCall::History(act)))
+                            }
                             Err(e) => {
                                 chunk_error =
                                     Some(format!("Failed to parse read_history: {e}").into());
                                 break;
                             }
                         },
-                        name => warn!("Unknown tool call `{name}`"),
+                        name => {
+                            warn!("Unknown tool call `{name}`");
+                            pending_memory
+                                .push((tool_call.id.clone(), MemoryCall::Unknown(name.to_owned())));
+                        }
                     },
                     Err(e) => {
                         chunk_error = Some(e.into());
@@ -310,7 +307,8 @@ async fn handle_query(
 
             if let Some(err) = chunk_error {
                 retry_count += 1;
-                if retry_count < max_retries {
+                total_errors += 1;
+                if retry_count < max_retries && total_errors <= max_total_errors {
                     warn!("Stream error on planning level ({retry_count}/{max_retries}): {err}");
                     messages.lock().await.add_message(
                         Message::user(vec![
@@ -318,6 +316,7 @@ async fn handle_query(
                         ])
                         .visibility(Visibility::Internal),
                     );
+                    utils::backoff(retry_count).await;
                     continue;
                 } else {
                     break Err(err);
@@ -326,17 +325,19 @@ async fn handle_query(
 
             if agent_tasks.is_empty()
                 && evals_list.is_empty()
-                && memory_results.is_empty()
+                && pending_memory.is_empty()
                 && text_response.trim().is_empty()
             {
                 retry_count += 1;
-                if retry_count < max_retries {
+                total_errors += 1;
+                if retry_count < max_retries && total_errors <= max_total_errors {
+                    let hint = if last_round {
+                        "You returned an empty response. No tools are available now: write the final answer for the user in plain text."
+                    } else {
+                        "You returned an empty response. Execute tools or answer the user."
+                    };
                     messages.lock().await.add_message(
-                        Message::user(vec![
-                            "You returned an empty response. Execute tools or answer the user."
-                                .into(),
-                        ])
-                        .visibility(Visibility::Internal),
+                        Message::user(vec![hint.into()]).visibility(Visibility::Internal),
                     );
                     continue;
                 } else {
@@ -351,6 +352,7 @@ async fn handle_query(
         };
 
         // if planning has failed after all the retreats
+        // (nothing has been executed yet, so repeating the iteration cannot duplicate side effects)
         if let Err(e) = planning_res {
             tx.send(Event::Error(e.to_string()).into()).await.ok();
             let prompt =
@@ -365,28 +367,27 @@ async fn handle_query(
             }
         }
 
+        // 3. Memory operations (run after the plan is valid; failures become results for the model)
+        let mut memory_results: Vec<(String, String, bool)> = vec![];
+        for (tool_call_id, call) in pending_memory {
+            let (text, silent) = run_memory_call(sid, call).await;
+            memory_results.push((tool_call_id, text, silent));
+        }
+
         let has_memory_ops = !memory_results.is_empty();
         let has_evals = !evals_list.is_empty();
         let has_tasks = !agent_tasks.is_empty();
 
-        if has_memory_ops || has_evals || has_tasks {
-            let mut guard = messages.lock().await;
-            if iteration == 0 {
-                guard.add_message(message.clone());
-            }
-        }
-
-        // 3. Process Memory Operations & Notifications
         if has_memory_ops {
             let mut msg_guard = messages.lock().await;
-            for (tool_call_id, res_text) in memory_results {
+            for (tool_call_id, res_text, _) in &memory_results {
                 tx.send(Event::Thinking(res_text.clone()).into()).await?;
                 let content_item: Content = format!("Memory Operation Result:\n{res_text}").into();
-                msg_guard.push_content(Some(&tool_call_id), content_item);
+                msg_guard.push_content(Some(tool_call_id), content_item);
             }
         }
 
-        // 4. Performing JS calculations
+        // 4. Performing JS calculations (an error is a result: the model fixes the code)
         if has_evals {
             let mut results: Vec<(String, String)> = vec![];
             for (tool_call_id, eval) in evals_list {
@@ -397,20 +398,32 @@ async fn handle_query(
                     .into(),
                 )
                 .await?;
-                let result = skills::handle_eval(eval).await?;
-                results.push((tool_call_id, format!("JS Result:\n{result}").into()));
+
+                let text = match skills::handle_eval(eval).await {
+                    Ok(result) => format!("JS Result:\n{result}"),
+                    Err(e) => {
+                        warn!("JavaScript failed, returning the error to the model: {e}");
+                        tx.send(Event::Thinking(format!("JavaScript error: {e}")).into())
+                            .await?;
+                        format!(
+                            "JS Error: {e}\nFix the code and call js_eval again, or answer without it."
+                        )
+                    }
+                };
+                results.push((tool_call_id, text));
             }
 
-            for (tool_call_id, content_item) in results {
+            for (tool_call_id, text) in results {
                 messages
                     .lock()
                     .await
-                    .push_content(Some(&tool_call_id), content_item);
+                    .push_content(Some(&tool_call_id), Content::text(text));
             }
         }
 
         // 5. Parallel Tool/Agent Execution
-        let mut execution_error = None;
+        // A failed skill writes its error into the tool result itself (see `skills::handle_skill`),
+        // so here only a disconnected client or a panic can fail the workers.
         if has_tasks {
             info!("Executing {} agent tasks in parallel", agent_tasks.len());
             let mut workers = JoinSet::new();
@@ -447,12 +460,14 @@ async fn handle_query(
                         match maybe_res {
                             Some(Ok(Ok(_))) => {}
                             Some(Ok(Err(e))) => {
-                                error!("[handle_agent] Execution failed: {e}");
-                                execution_error = Some(e);
+                                error!("[handle_agent] Execution aborted: {e}");
+                                workers.abort_all();
+                                return Err(e);
                             }
                             Some(Err(e)) => {
                                 error!("Agent task worker panicked: {e}");
-                                execution_error = Some(Error::Custom(e.to_string()).into());
+                                workers.abort_all();
+                                return Err(Error::Custom(e.to_string()).into());
                             }
                             None => break,
                         }
@@ -461,27 +476,19 @@ async fn handle_query(
             }
         }
 
-        // if task execution has dropped after max_retries inside handle_task
-        if let Some(err) = execution_error {
-            tx.send(Event::Error(err.to_string()).into()).await.ok();
-            let prompt =
-                format!("Task processing failed with an error: {err}. Do you want to try again?");
-            if ask_retry(&tx, prompt).await.unwrap_or(false) {
-                info!("User requested retry after task error. Retrying iteration {iteration}...");
-                continue 'iteration_loop;
-            } else {
-                return Err(err);
-            }
-        }
+        // 6. Recursion / Control Step Dispatch.
+        // Silent memory operations (a saved fact) do not need another LLM round
+        // if the model has already answered the user.
+        let needs_followup = has_tasks
+            || has_evals
+            || memory_results.iter().any(|(_, _, silent)| !*silent)
+            || (has_memory_ops && final_text_response.trim().is_empty());
 
-        // 6. Recursion / Control Step Dispatch
-        let had_actions = has_tasks || has_evals || has_memory_ops;
-
-        if had_actions {
-            if iteration + 1 >= exec_options.max_iterations {
+        if needs_followup {
+            if iteration + 1 >= max_iterations {
                 warn!(
                     "Reached maximum allowed iterations ({}), stopping recursive execution.",
-                    exec_options.max_iterations
+                    max_iterations
                 );
                 tx.send(Event::Finish.into()).await?;
 
@@ -497,8 +504,16 @@ async fn handle_query(
                     "Sub-tasks finished. Launching control query (iteration {})...",
                     iteration + 1
                 );
-                let control_msg = Message::user(vec![cfg.llm.control_prompt().into()])
-                    .visibility(Visibility::Internal);
+
+                let mut control_text = cfg.llm.control_prompt().to_owned();
+                if max_iterations > 1 && iteration + 2 >= max_iterations {
+                    control_text.push_str(
+                        "\n\nThis is the LAST step: no tools are available anymore. \
+                         Report what was done and, honestly, what failed.",
+                    );
+                }
+                let control_msg =
+                    Message::user(vec![control_text.into()]).visibility(Visibility::Internal);
 
                 handle_query(
                     sid,
@@ -509,11 +524,12 @@ async fn handle_query(
                     root_user_msg.clone(),
                     current_path,
                     iteration + 1,
+                    facts_cache,
                 )
                 .await?;
             }
         } else {
-            // no actions (direct final response to the user)
+            // no actions left (direct final response to the user)
             tx.send(Event::Finish.into()).await?;
             info!("Query processing finished completely.");
 
@@ -524,6 +540,108 @@ async fn handle_query(
     }
 
     Ok(())
+}
+
+/// Joins non-empty prompt blocks.
+fn join_blocks<const N: usize>(blocks: [String; N]) -> String {
+    blocks
+        .into_iter()
+        .filter(|s| !s.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n---\n")
+}
+
+/// Builds the rules block (the model does not need IDs and scopes: they are for the user's commands).
+fn build_rules_prompt(rules: Vec<UserRule>) -> String {
+    if rules.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::from("MANDATORY RULES & PREFERENCES (STRICTLY FOLLOW THEM):\n");
+    for rule in rules {
+        out.push_str(&format!("  * {}\n", rule.text.trim()));
+    }
+    out
+}
+
+/// Loads facts relevant to the user's message into a prompt block (empty if nothing is relevant).
+///
+/// The message is used as is (no translation: embeddings are multilingual); the block is limited
+/// by the number of facts and by a character budget.
+async fn load_facts_prompt(sid: SessionId, user_text: &str) -> String {
+    if utils::is_trivial_message(user_text) {
+        return String::new();
+    }
+
+    let user = match UserState::get_or_init(sid.user_id).await {
+        Ok(user) => user,
+        Err(e) => {
+            error!("[Facts] Failed to get user state: {e}");
+            return String::new();
+        }
+    };
+
+    let ctx = &Config::get().context;
+    let records = match user.search_facts(user_text, Some(ctx.limit())).await {
+        Ok(records) => records,
+        Err(e) => {
+            error!("[Facts] Failed to search facts: {e}");
+            return String::new();
+        }
+    };
+
+    let budget = ctx.facts_max_chars;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for record in records {
+        let line = format!("  * {}\n", record.data.text.trim());
+        let len = line.chars().count();
+        if used > 0 && used + len > budget {
+            break;
+        }
+        used += len;
+        out.push_str(&line);
+    }
+
+    if out.is_empty() {
+        String::new()
+    } else {
+        format!("USER FACTS (relevant to this request, use when necessary):\n{out}")
+    }
+}
+
+/// Executes a memory tool call. Returns the text for the model and whether the result is "silent"
+/// (the model needs no further round to react to it). Errors become results, never failures.
+async fn run_memory_call(sid: SessionId, call: MemoryCall) -> (String, bool) {
+    if let MemoryCall::Unknown(name) = &call {
+        return (
+            format!(
+                "Unknown tool `{name}`. Available tools: use_skill, js_eval, remember_fact, search_fact, read_history."
+            ),
+            false,
+        );
+    }
+
+    let user = match UserState::get_or_init(sid.user_id).await {
+        Ok(user) => user,
+        Err(e) => return (format!("Memory is unavailable: {e}"), false),
+    };
+
+    match call {
+        MemoryCall::Remember(act) => match skills::handle_remember_fact(&user, act).await {
+            Ok(outcome) => (outcome.text, outcome.silent),
+            Err(e) => (format!("Failed to save the fact: {e}"), false),
+        },
+        MemoryCall::Search(act) => match skills::handle_search_fact(&user, act).await {
+            Ok(text) => (text, false),
+            Err(e) => (format!("Failed to search facts: {e}"), false),
+        },
+        MemoryCall::History(act) => match skills::handle_read_history(&user, act).await {
+            Ok(text) => (text, false),
+            Err(e) => (format!("Failed to read history: {e}"), false),
+        },
+        MemoryCall::Unknown(_) => unreachable!("handled above"),
+    }
 }
 
 /// Persists `(User, Assistant)` pair when a top-level turn finishes.

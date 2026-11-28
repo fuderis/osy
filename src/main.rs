@@ -186,6 +186,8 @@ async fn serve(_: CommandContext) -> Result<()> {
         .post("/users/{uid}/facts/remove", hands::handle_user_facts_remove)
         .post("/users/{uid}/facts/clear", hands::handle_user_facts_clear)
         .post("/users/{uid}/facts/search", hands::handle_user_facts_search)
+        .post("/users/{uid}/facts/probe", hands::handle_user_facts_probe)
+        .post("/users/{uid}/facts/reindex", hands::handle_user_facts_reindex)
         .post("/users/{uid}/rules/list", hands::handle_user_rules_list)
         .post("/users/{uid}/rules/set", hands::handle_user_rules_set)
         .post("/users/{uid}/rules/remove", hands::handle_user_rules_remove)

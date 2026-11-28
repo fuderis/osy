@@ -2,7 +2,7 @@
 
 use crate::{prelude::*, user::UserState};
 
-use osy_share::{ListQuery, RemoveQuery, SearchQuery, SetQuery};
+use osy_share::{FactProbe, ListQuery, RemoveQuery, SearchQuery, SetQuery};
 
 macro_rules! get_user {
     ($uid:expr) => {{
@@ -68,6 +68,48 @@ pub async fn handle_user_facts_search(uid: Paths<u64>, query: Json<SearchQuery>)
     }
 }
 
+/// API: Search with scores and without thresholds (calibration of `fact_similarity` and `fact_margin`).
+#[log(uid = %*uid)]
+pub async fn handle_user_facts_probe(uid: Paths<u64>, query: Json<SearchQuery>) -> Response {
+    let SearchQuery { query, limit } = query.0;
+
+    let user = get_user!(*uid);
+
+    match user.probe_facts(&query, limit.unwrap_or(10)).await {
+        Ok(records) => {
+            let hits: Vec<FactProbe> = records
+                .into_iter()
+                .map(|r| FactProbe {
+                    id: r.id,
+                    text: r.data.text,
+                    score: r.score,
+                    similarity: r.similarity,
+                    lexical: r.lexical,
+                })
+                .collect();
+            Response::ok().json(&hits)
+        }
+        Err(e) => {
+            error!("Failed to probe facts for user {}: {e}", *uid);
+            Response::error().text(e.to_string())
+        }
+    }
+}
+
+/// API: Re-embeds all facts (after changing the embeddings model or the search algorithm).
+#[log(uid = %*uid)]
+pub async fn handle_user_facts_reindex(uid: Paths<u64>) -> Response {
+    let user = get_user!(*uid);
+
+    match user.reindex_facts().await {
+        Ok(count) => Response::ok().text(format!("Re-embedded {count} facts")),
+        Err(e) => {
+            error!("Failed to reindex facts for user {}: {e}", *uid);
+            Response::error().text(e.to_string())
+        }
+    }
+}
+
 /// Adds or updates user fact in RAG memory.
 #[log(uid = %*uid)]
 pub async fn handle_user_facts_set(uid: Paths<u64>, query: Json<SetQuery>) -> Response {
@@ -86,7 +128,8 @@ pub async fn handle_user_facts_set(uid: Paths<u64>, query: Json<SetQuery>) -> Re
     }
 
     // save fact in DB
-    match user.save_fact(text).await {
+    // the user decides explicitly, so near-duplicates are allowed (exact duplicates are still skipped)
+    match user.save_fact(text, None, false).await {
         Ok(_) => Response::ok().text("Fact saved successfully"),
         Err(e) => {
             error!("Failed to set fact for user {}: {e}", *uid);

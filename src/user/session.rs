@@ -30,6 +30,8 @@ pub struct Session {
     pub user_id: u64,
     /// Session metadata cached in-memory.
     pub metadata: SessionMetadata,
+    /// Rendered dialog map lines (lazy cache: `(max_chars, lines)`, one line per turn pair).
+    dialog_lines: Option<(usize, Vec<String>)>,
 }
 
 impl Session {
@@ -105,6 +107,7 @@ impl Session {
                 kv_db,
                 user_id: uid,
                 metadata,
+                dialog_lines: None,
             }));
 
             user.sessions.insert(sid, this.clone());
@@ -253,6 +256,27 @@ impl Session {
         }
     }
 
+    /// Reads the last `n` `(User, Assistant)` message pairs in chronological order.
+    #[log(sid = %self.id, n = n)]
+    pub async fn read_last_pairs(&self, n: usize) -> Result<Vec<MessagePair>> {
+        if n == 0 || self.metadata.message_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let start = self.metadata.message_count.saturating_sub(n);
+        let table_name = str!(self.id);
+        let table = self.kv_db.open_table(&table_name).await?;
+
+        let mut pairs = Vec::with_capacity(self.metadata.message_count - start);
+        for i in start..self.metadata.message_count {
+            if let Some(pair) = table.read::<_, MessagePair>(Key::Message(i)).await? {
+                pairs.push(pair);
+            }
+        }
+
+        Ok(pairs)
+    }
+
     /// Reads all original session messages flattened in chronological order (`0..message_count`).
     #[log(sid = %self.id)]
     pub async fn read_messages(&self) -> Result<Vec<Message>> {
@@ -276,26 +300,50 @@ impl Session {
         Ok(messages)
     }
 
-    /// Builds a compact dialog map with each turn's text truncated to `max_chars` per side.
+    /// Builds a compact dialog map: the latest `max_turns` turns, each side truncated to `max_chars`.
+    ///
+    /// Lines are cached in memory (the database is read once per session activation, then the cache
+    /// is extended by `write_messages`). Older turns stay reachable through `read_history`.
     #[log(sid = %self.id, max_chars = max_chars)]
-    pub async fn dialog_map(&self, max_chars: usize) -> Result<String> {
+    pub async fn dialog_map(&mut self, max_chars: usize, max_turns: usize) -> Result<String> {
         let count = self.metadata.message_count;
         if count == 0 {
             return Ok(String::new());
         }
 
-        let table_name = str!(self.id);
-        let table = self.kv_db.open_table(&table_name).await?;
+        let fresh = matches!(
+            &self.dialog_lines,
+            Some((chars, lines)) if *chars == max_chars && lines.len() == count
+        );
+
+        if !fresh {
+            let table_name = str!(self.id);
+            let table = self.kv_db.open_table(&table_name).await?;
+
+            let mut lines = Vec::with_capacity(count);
+            for i in 0..count {
+                lines.push(match table.read::<_, MessagePair>(Key::Message(i)).await? {
+                    Some(pair) => dialog_line(i, &pair, max_chars),
+                    None => String::new(),
+                });
+            }
+            self.dialog_lines = Some((max_chars, lines));
+        }
+
+        let lines = self
+            .dialog_lines
+            .as_ref()
+            .map(|(_, l)| l.as_slice())
+            .unwrap_or(&[]);
+        let start = count.saturating_sub(max_turns.max(1));
 
         let mut out = String::from("Dialog map ([ID] User -> Assistant):\n");
-        for i in 0..count {
-            if let Some((user_msg, assistant_msg)) =
-                table.read::<_, MessagePair>(Key::Message(i)).await?
-            {
-                let u = utils::truncate_inline(&user_msg.extract_texts().join(" "), max_chars);
-                let a = utils::truncate_inline(&assistant_msg.extract_texts().join(" "), max_chars);
-                out.push_str(&format!("[{i}] {u} -> {a}\n"));
-            }
+        if start > 0 {
+            out.push_str(&format!("(turns 0..{} omitted)\n", start - 1));
+        }
+        for line in lines.iter().skip(start).filter(|l| !l.is_empty()) {
+            out.push_str(line);
+            out.push('\n');
         }
         out.push_str(
             "Use `read_history` with turn ID to inspect full original messages if needed.",
@@ -313,7 +361,24 @@ impl Session {
         let table_name = str!(self.id);
         let table = self.kv_db.open_table(&table_name).await?;
 
+        // keep the dialog map cache in sync (rendered before `pair` is moved)
+        let new_line = self
+            .dialog_lines
+            .as_ref()
+            .map(|(chars, _)| dialog_line(index, &pair, *chars));
+
         table.write(Key::Message(index), pair).await?;
+
+        let synced = match (self.dialog_lines.as_mut(), new_line) {
+            (Some((_, lines)), Some(line)) if lines.len() == index => {
+                lines.push(line);
+                true
+            }
+            _ => false,
+        };
+        if !synced {
+            self.dialog_lines = None;
+        }
 
         self.metadata.message_count += 1;
         table.write(Key::Metadata, self.metadata.clone()).await?;
@@ -338,6 +403,7 @@ impl Session {
             session_id: self.id,
             ..Default::default()
         };
+        self.dialog_lines = None;
 
         table.write(Key::Metadata, self.metadata.clone()).await?;
         table.flush().await?;
@@ -500,6 +566,7 @@ impl Session {
             kv_db: new_kv_db,
             user_id: self.user_id,
             metadata: new_meta,
+            dialog_lines: None,
         }));
 
         let user = self.user().await?;
@@ -516,4 +583,11 @@ impl Session {
 
         Ok(new_id)
     }
+}
+
+/// Renders one dialog map line.
+fn dialog_line(index: usize, pair: &MessagePair, max_chars: usize) -> String {
+    let u = utils::truncate_inline(&pair.0.extract_texts().join(" "), max_chars);
+    let a = utils::truncate_inline(&pair.1.extract_texts().join(" "), max_chars);
+    format!("[{index}] {u} -> {a}")
 }

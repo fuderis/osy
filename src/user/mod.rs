@@ -9,9 +9,23 @@ use crate::{prelude::*, utils};
 
 use anylm::embeddings::Search;
 use atoman::dashmap::DashMap;
-use cistern::{Context, ContextRecord, Storage, gen_id};
+use cistern::{
+    Context, Storage,
+    context::{ScoredRecord, SearchOptions},
+    gen_id,
+};
 use osy_share::{SessionId, SessionMetadata, UserFact, UserMetadata, UserRule};
 use tokio::sync::OnceCell;
+
+/// Result of saving a fact.
+pub enum SaveFact {
+    /// The fact was written (new ID).
+    Saved(u64),
+    /// The same fact already exists, nothing was changed.
+    Duplicate,
+    /// Near-duplicates exist, nothing was changed (the caller decides whether to replace one of them).
+    Similar(Vec<UserFact>),
+}
 
 /// Lazily initialized user slot (a slot is created atomically, the state is built once).
 type UserSlot = Arc<OnceCell<Arc<UserState>>>;
@@ -266,75 +280,155 @@ impl UserState {
 }
 
 impl UserState {
-    /// Retains new user fact (with deduplication).
-    pub async fn save_fact(&self, text: impl Into<String>) -> Result<()> {
-        let text = text.into();
-        if text.trim().is_empty() {
+    /// Retains new user fact.
+    ///
+    /// Facts are embedded as written (no translation and no LLM rewriting). Nothing is ever deleted silently:
+    /// * an exact duplicate (case/whitespace-insensitive) is a no-op;
+    /// * `replaces` removes exactly that fact and writes the new one;
+    /// * with `guard_similar`, near-duplicates are returned to the caller instead of being overwritten.
+    pub async fn save_fact(
+        &self,
+        text: impl Into<String>,
+        replaces: Option<u64>,
+        guard_similar: bool,
+    ) -> Result<SaveFact> {
+        let text = text.into().trim().to_owned();
+        if text.is_empty() {
             return Err(Error::Custom("Fact text cannot be empty.".into()).into());
         }
 
-        // generate text embedding
-        let search_text = utils::normalize_fact_text(&text).await;
-        let embedding = utils::generate_embedding(&search_text, Search::Document).await?;
+        let embedding = utils::generate_embedding(&text, Search::Document).await?;
 
-        // remove duplicate (if exists)
+        // look for near-duplicates
         let table = self.rag_db.open_table(FACTS_TABLE_NAME).await?;
-        let dedup_threshold = Config::get().context.dedup_similarity;
+        let dedup_threshold = Config::get().context.dedup_threshold();
 
-        if let Ok(Some(similar_facts)) = table
+        let neighbours: Vec<UserFact> = match table
             .read::<UserFact>(embedding.clone(), Some(5), dedup_threshold)
             .await
         {
-            for record in similar_facts {
-                if record.data.text.trim().eq_ignore_ascii_case(text.trim()) {
-                    return Ok(());
-                }
-                let _ = table.remove(record.id).await;
-            }
+            Ok(Some(records)) => records.into_iter().map(|r| r.data).collect(),
+            _ => vec![],
+        };
+
+        let key = utils::fact_key(&text);
+        if neighbours.iter().any(|f| utils::fact_key(&f.text) == key) {
+            return Ok(SaveFact::Duplicate);
         }
 
-        // create fact
+        if let Some(old_id) = replaces {
+            // explicit replacement requested by the caller
+            let _ = table.remove(old_id).await;
+        } else if guard_similar && !neighbours.is_empty() {
+            return Ok(SaveFact::Similar(neighbours.into_iter().take(3).collect()));
+        }
+
+        // write fact to database
         let fact_id = gen_id();
         let fact = UserFact {
             id: fact_id,
-            text: text.trim().to_owned(),
-            search_text,
+            // kept for storage compatibility: the embedding is built from the original text
+            search_text: text.clone(),
+            text,
             created_at: Utc::now(),
         };
 
-        // write fact to database
         table.write(fact_id, embedding, fact).await?;
-        Ok(())
+        Ok(SaveFact::Saved(fact_id))
     }
 
-    /// Searches user's facts in database.
+    /// Searches user's facts in database (hybrid: by meaning and by exact words).
+    ///
+    /// The query is embedded as is: the embeddings model is multilingual, so no translation is needed.
+    /// Only relevant facts are returned: cosine similarity above the floor, close to the best hit,
+    /// plus exact word matches (names, versions, models).
     pub async fn search_facts(
         &self,
         query: &str,
         limit: Option<usize>,
-    ) -> Result<Vec<ContextRecord<UserFact>>> {
-        if query.trim().is_empty() {
+    ) -> Result<Vec<ScoredRecord<UserFact>>> {
+        let ctx = &Config::get().context;
+        let max = ctx.limit();
+        let limit = limit.unwrap_or(max).clamp(1, max * 2);
+
+        self.run_fact_search(
+            query,
+            limit,
+            ctx.similarity_threshold(),
+            ctx.margin(),
+            ctx.hybrid_search,
+        )
+        .await
+    }
+
+    /// Searches facts WITHOUT thresholds and with scores: for calibrating `fact_similarity` and `fact_margin`.
+    pub async fn probe_facts(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ScoredRecord<UserFact>>> {
+        let hybrid = Config::get().context.hybrid_search;
+        self.run_fact_search(query, limit.clamp(1, 50), -1.0, None, hybrid)
+            .await
+    }
+
+    async fn run_fact_search(
+        &self,
+        query: &str,
+        limit: usize,
+        min_similarity: f32,
+        margin: Option<f32>,
+        hybrid: bool,
+    ) -> Result<Vec<ScoredRecord<UserFact>>> {
+        let query = utils::fact_query(query);
+        if query.is_empty() {
             return Err(Error::Custom("Search query cannot be empty.".into()).into());
         }
-
-        // if it’s not English, translate it
-        let query = if !utils::is_english(&query) {
-            utils::translate_to_english(&query, true).await?
-        } else {
-            query.trim().to_owned()
-        };
 
         // generate query embedding
         let embedding = utils::generate_embedding(&query, Search::Query).await?;
 
-        let ctx = &Config::get().context;
-        let dist = ctx.fact_similarity;
-
         // search facts in database
         let table = self.rag_db.open_table(FACTS_TABLE_NAME).await?;
-        let records = table.read(embedding, limit, dist).await?;
+        let found = table
+            .search::<UserFact>(
+                embedding,
+                SearchOptions {
+                    limit,
+                    min_similarity,
+                    margin,
+                    text: hybrid.then(|| query.clone()),
+                    lexical_fields: Some(vec!["text".to_owned()]),
+                },
+            )
+            .await?;
 
-        Ok(records.unwrap_or_default())
+        Ok(found)
+    }
+
+    /// Re-embeds ALL facts from their original text and atomically replaces the table content.
+    ///
+    /// Needed after changing the embeddings model or the indexing algorithm (old facts were embedded
+    /// from an LLM-expanded English text). Nothing is written until all embeddings are ready.
+    pub async fn reindex_facts(&self) -> Result<usize> {
+        let facts = self.load_facts().await?;
+        if facts.is_empty() {
+            return Ok(0);
+        }
+
+        let mut items = Vec::with_capacity(facts.len());
+        for mut fact in facts {
+            let embedding = utils::generate_embedding(&fact.text, Search::Document).await?;
+            fact.search_text = fact.text.clone();
+            items.push((fact.id, embedding, fact));
+        }
+
+        let count = items.len();
+        let table = self.rag_db.open_table(FACTS_TABLE_NAME).await?;
+        table.replace_all(items).await?;
+        table.ensure_index().await?;
+
+        Ok(count)
     }
 
     /// Returns list of all user's facts.

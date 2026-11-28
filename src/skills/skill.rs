@@ -1,7 +1,7 @@
 use crate::{handlers, prelude::*};
 
 use anylm::{Content, Message, Messages, Schema, Tool};
-use osy_share::SessionInfo;
+use osy_share::{Event, SessionInfo};
 
 /// Returns tools list.
 pub fn tools_list() -> Vec<Tool> {
@@ -25,6 +25,10 @@ pub struct SkillAction {
 }
 
 /// Handles agent skill (isolated).
+///
+/// A failed skill does not abort the user's query: the error is written into the tool result,
+/// so the orchestrator can retry with other parameters or honestly report the failure.
+/// Successfully finished sibling tasks are never re-run because of it.
 #[log(skill = %task.skill)]
 pub async fn handle_skill(
     tx: Sender<Bytes>,
@@ -33,15 +37,32 @@ pub async fn handle_skill(
     current_path: Option<PathBuf>,
     task: SkillAction,
 ) -> Result<()> {
-    let skill_response = handlers::handle_skill(
-        tx,
+    let skill_name = task.skill.clone();
+
+    let skill_response = match handlers::handle_skill(
+        tx.clone(),
         session_info,
         &task.skill,
         Message::user(vec![task.query.into()]),
         current_path,
         false,
     )
-    .await?;
+    .await
+    {
+        Ok(text) => text,
+        // the client has gone: nothing to heal
+        Err(e) if tx.is_closed() => return Err(e),
+        Err(e) => {
+            warn!("Skill `{skill_name}` failed: {e}");
+            tx.send(Event::Thinking(format!("Skill `{skill_name}` failed: {e}")).into())
+                .await
+                .ok();
+            format!(
+                "Skill `{skill_name}` failed: {e}\n\
+                 You may retry once with corrected parameters. If it fails again, tell the user what went wrong."
+            )
+        }
+    };
 
     // recording result of skill execution in the parent message context
     messages

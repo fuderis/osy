@@ -86,3 +86,45 @@ pub fn truncate_inline(text: &str, max_chars: usize) -> String {
         head
     }
 }
+
+/// Builds a compact search query for fact retrieval from a user message (no LLM involved).
+///
+/// Drops code blocks and markdown, collapses whitespace and cuts the text to `FACT_QUERY_MAX_CHARS`
+/// (a long text dilutes the embedding). The language is kept as is: embeddings are multilingual.
+pub fn fact_query(text: &str) -> String {
+    const FACT_QUERY_MAX_CHARS: usize = 300;
+
+    strip_markdown(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(FACT_QUERY_MAX_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_owned()
+}
+
+/// Returns true for pure acknowledgements ("ok", "thanks", "да"...) where searching memory is pointless.
+pub fn is_trivial_message(text: &str) -> bool {
+    const TRIVIAL: &[&str] = &[
+        "ok", "okay", "k", "yes", "no", "yep", "nope", "thanks", "thx", "thank you", "got it",
+        "sure", "fine", "cool", "ок", "окей", "да", "нет", "угу", "ага", "спасибо", "благодарю",
+        "понял", "поняла", "ясно", "хорошо", "ладно", "отлично", "круто",
+    ];
+
+    let normalized = text
+        .trim()
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+
+    normalized.is_empty() || TRIVIAL.contains(&normalized.as_str())
+}
+
+/// Normalizes a fact text for exact-duplicate comparison (case and whitespace insensitive, Unicode-aware).
+pub fn fact_key(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}

@@ -46,7 +46,8 @@ TOOL AND RUNTIME USAGE RULES!:
 * Remember: it has no access to the OS, network, files, or user context.
 
 2. search_fact:
-* Always call the `search_fact` tool whenever you need to fetch personal preferences, history, or specific user data.
+* Relevant user facts are already preloaded in your context when they exist. Do NOT search for them again.
+* Call `search_fact` only if a specific personal detail is missing. Write the query in the user's language, 2-6 words.
 
 3. Skills:
 * For specialized actions, use STRICTLY only the skills explicitly declared in your current context (never invent skill names).
@@ -55,16 +56,12 @@ TOOL AND RUNTIME USAGE RULES!:
 
 /// Default skill prompt.
 const SKILL_PROMPT: &'static str = "\
-Role: You are Osy, a smart personal assistant.
-Archetype: Pragmatic and exceptionally precise.
+Role: You are a task executor inside Osy. Your result is read by another assistant or directly by the user.
 
 Response Rules:
-* Language: Match the user's language.
-* Format: Polite, concise, structured, and strictly to the point.
-* Tone: Calm confidence. Subtle humor is acceptable.
-* Substance: Facts, algorithms, and architectural logic only.
-* Closing: End with a concise clarifying question or direct next step when appropriate.
-* Formatting: Use Markdown (tables, lists, clean structure).
+* Return ONLY the result: facts, values, status, errors. No greetings, no questions, no persuasion.
+* Be as short as possible. Use compact Markdown only when it helps.
+* If a tool fails, read the error, fix the arguments and call it again. Report the failure only if it repeats.
 
 ---
 
@@ -75,7 +72,7 @@ TOOL AND RUNTIME USAGE RULES!:
 * Remember: it has no access to the OS, network, files, or user context.
 
 2. search_fact:
-* Always call the `search_fact` tool whenever you need to fetch personal preferences, history, or specific user data.\
+* Call `search_fact` only if a specific personal detail is required. Write the query in the user's language.\
 ";
 
 /// Default control query prompt.
@@ -85,27 +82,7 @@ The background tasks/tools have finished. Now write the FINAL response to the us
 CRITICAL INSTRUCTIONS:
 1. The user CANNOT see tool outputs or background task logs. You must explicitly present all gathered results, findings, and data in your text answer.
 2. NEVER say \"as shown above\", \"already provided\", or refer to previous turns. Act as if you are delivering this information for the very first time.
-3. If tasks failed and can be retried with different parameters, call the tool again. Otherwise, deliver the final complete answer.\
-";
-
-const TRANSLATE_PROMPT: &'static str = "\
-You are a translator. Translate the given text to English.\
-";
-
-/// Default normalization prompt.
-const NORMALIZE_PROMPT: &'static str = "\
-You are a context indexing expert. Your task is to process a user-related fact and convert it into an optimized format for vector search and structured memory retrieval.
-
-Instructions:
-
-1. Translate the original fact strictly into ENGLISH, regardless of its source language.
-
-2. Generate an expanded, high-density `search text` optimized for semantic embeddings:
-* Explicitly define the subject (e.g., replace vague pronouns with \"The user\").
-* Add relevant English domain terms, categories, synonyms, and natural query phrasings.
-* Retain all original facts, preferences, dates, proper names, and tech stack details without loss of detail.
-
-3. Extract 3 to 7 relevant keywords/tags for lexical matching (e.g., categories, specific entity names, tech stacks).\
+3. If a task failed, you may retry it once with corrected parameters. If the error repeats, or no tools are left, honestly tell the user what failed and why. Otherwise, deliver the final complete answer.\
 ";
 
 /// Default compression prompt.
@@ -180,21 +157,31 @@ impl Default for ServerOptions {
 
 /// Execution control options for assistant runs.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ExecutionOptions {
-    /// Number of recent messages to preserve during context compression.
-    pub preserve_messages: usize,
-    /// Maximum number of retries for failed AI calls.
+    /// Number of last message pairs that are always loaded without trimming the length.
+    pub preserve_pairs: usize,
+    /// Maximum number of consecutive retries for failed AI calls (resets after a successful step).
     pub max_retries: usize,
-    /// Maximum number of recursive query handling cycles.
+    /// Maximum number of recursive orchestrator cycles per user query.
     pub max_iterations: usize,
+    /// Maximum number of LLM steps inside one skill run.
+    pub skill_max_iterations: usize,
+    /// Maximum total number of AI errors inside one run (protects from endless alternation of fail/success).
+    pub max_total_errors: usize,
+    /// How many times the same tool call (same name and arguments) is executed within one skill run.
+    pub max_identical_calls: usize,
 }
 
 impl Default for ExecutionOptions {
     fn default() -> Self {
         Self {
-            preserve_messages: 2,
+            preserve_pairs: 1,
             max_retries: 3,
             max_iterations: 5,
+            skill_max_iterations: 8,
+            max_total_errors: 6,
+            max_identical_calls: 3,
         }
     }
 }
@@ -225,10 +212,6 @@ pub struct LLMOptions {
     pub skill_prompt: String,
     /// Control prompt for evaluating agent task execution.
     pub control_prompt: String,
-    /// Prompt for translating text to English.
-    pub translate_prompt: String,
-    /// Prompt for normalize text before embeddings save.
-    pub normalize_prompt: String,
     /// Prompt used for summarizing and compressing context.
     pub compress_prompt: String,
 
@@ -236,10 +219,6 @@ pub struct LLMOptions {
     pub assist_temperature: f32,
     /// Agent skill temperature.
     pub skill_temperature: f32,
-    /// Language translation temperature.
-    pub translate_temperature: f32,
-    /// Context normalization temperature.
-    pub normalize_temperature: f32,
     /// Chat compession temperature.
     pub compress_temperature: f32,
 
@@ -255,15 +234,11 @@ impl Default for LLMOptions {
             system_prompt: SYSTEM_PROMPT.trim().into(),
             assist_prompt: ASSISTANT_PROMPT.trim().into(),
             skill_prompt: SKILL_PROMPT.trim().into(),
-            translate_prompt: TRANSLATE_PROMPT.trim().into(),
-            normalize_prompt: NORMALIZE_PROMPT.trim().into(),
             control_prompt: CONTROL_PROMPT.trim().into(),
             compress_prompt: COMPRESSION_PROMPT.trim().into(),
 
             assist_temperature: 0.6,
             skill_temperature: 0.2,
-            translate_temperature: 0.4,
-            normalize_temperature: 0.4,
             compress_temperature: 0.4,
 
             completions: Options::openai()
@@ -292,12 +267,6 @@ impl LLMOptions {
     pub fn control_prompt(&self) -> &str {
         self.control_prompt.trim()
     }
-    pub fn translate_prompt(&self) -> &str {
-        self.translate_prompt.trim()
-    }
-    pub fn normalize_prompt(&self) -> &str {
-        self.normalize_prompt.trim()
-    }
     pub fn compress_prompt(&self) -> &str {
         self.compress_prompt.trim()
     }
@@ -310,18 +279,6 @@ impl LLMOptions {
 
     pub fn skill_options(&self) -> Options {
         self.completions.clone().temperature(self.skill_temperature)
-    }
-
-    pub fn translate_options(&self) -> Options {
-        self.completions
-            .clone()
-            .temperature(self.translate_temperature)
-    }
-
-    pub fn normalize_options(&self) -> Options {
-        self.completions
-            .clone()
-            .temperature(self.normalize_temperature)
     }
 
     pub fn compress_options(&self) -> Options {
@@ -340,23 +297,79 @@ impl LLMOptions {
 }
 
 /// Context and RAG memory options.
+///
+/// Thresholds are clamped by the accessors below, so a wrong value in `config.toml`
+/// cannot silently destroy facts or flood the prompt.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ContextOptions {
-    /// Default similarity threshold for RAG retrieval.
+    /// Minimum cosine similarity of a fact to be returned by search (0.0..=1.0).
+    /// The baseline depends on the embeddings model: calibrate it with `/facts probe <query>`.
     pub fact_similarity: f32,
-    /// Threshold for deduplication or overwriting facts in save_fact.
+    /// Vector hits further than this from the best one are dropped (cuts the noisy tail, 0 = off).
+    pub fact_margin: f32,
+    /// Also search facts by exact words (names, versions, models) and fuse both rankings.
+    pub hybrid_search: bool,
+    /// Similarity at which a new fact is considered a near-duplicate of an existing one.
+    /// Facts are never deleted automatically: the model is asked to confirm the replacement.
     pub dedup_similarity: f32,
     /// Maximum facts to retrieve per query.
     pub search_limit: usize,
+    /// Character budget of the auto-loaded facts block in the prompt.
+    pub facts_max_chars: usize,
+    /// How many latest turns are shown in the dialog map (older ones are available via `read_history`).
+    pub dialog_map_turns: usize,
+    /// Maximum characters per side (user / assistant) of one dialog map line.
+    pub dialog_map_chars: usize,
 }
 
 impl Default for ContextOptions {
     fn default() -> Self {
         Self {
-            fact_similarity: 0.2,
-            dedup_similarity: 0.8,
-            search_limit: 10,
+            // lenient on purpose: the injected block is bounded by `search_limit` and `facts_max_chars`
+            fact_similarity: 0.3,
+            fact_margin: 0.12,
+            hybrid_search: true,
+            dedup_similarity: 0.92,
+            search_limit: 8,
+            facts_max_chars: 800,
+            dialog_map_turns: 30,
+            dialog_map_chars: 160,
         }
+    }
+}
+
+impl ContextOptions {
+    /// Search threshold (always within 0.0..=1.0).
+    pub fn similarity_threshold(&self) -> f32 {
+        if self.fact_similarity.is_finite() {
+            self.fact_similarity.clamp(0.0, 1.0)
+        } else {
+            0.3
+        }
+    }
+
+    /// Margin of the best-hit window (`None` = disabled).
+    pub fn margin(&self) -> Option<f32> {
+        if self.fact_margin.is_finite() && self.fact_margin > 0.0 {
+            Some(self.fact_margin.clamp(0.0, 1.0))
+        } else {
+            None
+        }
+    }
+
+    /// Near-duplicate threshold (never below 0.85: loose values would merge different facts).
+    pub fn dedup_threshold(&self) -> f32 {
+        if self.dedup_similarity.is_finite() {
+            self.dedup_similarity.clamp(0.85, 1.0)
+        } else {
+            0.92
+        }
+    }
+
+    /// Facts per query (at least 1, at most 50).
+    pub fn limit(&self) -> usize {
+        self.search_limit.clamp(1, 50)
     }
 }
 

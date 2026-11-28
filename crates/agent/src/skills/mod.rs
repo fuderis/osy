@@ -10,7 +10,7 @@ use osy_skill::AgentSkill;
 #[serde(rename_all = "snake_case")]
 #[display(rename_all = "snake_case")]
 pub enum SkillKind {
-    #[skill(module = "test", description = "Test skill.")]
+    /// Test skill.
     #[tool(name = "hello", description = "Prints hello.")]
     Test,
 }

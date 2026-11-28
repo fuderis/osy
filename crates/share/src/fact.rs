@@ -8,7 +8,9 @@ pub struct UserFact {
     pub id: u64,
     /// Raw text content of the fact
     pub text: String,
-    /// Text optimized for vector search/embeddings
+    /// Legacy field kept for storage compatibility (equals `text` for new facts;
+    /// old facts may hold an LLM-expanded English variant)
+    #[serde(default)]
     pub search_text: String,
     /// Unix timestamp (in seconds, UTC) when the fact was stored
     pub created_at: DateTime<Utc>,

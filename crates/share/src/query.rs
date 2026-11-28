@@ -56,3 +56,16 @@ pub struct SearchQuery {
     #[serde(default)]
     pub limit: Option<usize>,
 }
+
+/// One hit of the fact search with relevance details (for calibration, `/facts probe`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FactProbe {
+    pub id: u64,
+    pub text: String,
+    /// Final relevance (0..=1).
+    pub score: f32,
+    /// Cosine similarity, if the fact is among the nearest vectors.
+    pub similarity: Option<f32>,
+    /// Lexical match strength (0..=1).
+    pub lexical: f32,
+}

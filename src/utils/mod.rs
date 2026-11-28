@@ -37,9 +37,11 @@ pub fn now_local(timezone_m: i16) -> DateTime<FixedOffset> {
     utc_now.with_timezone(&tz)
 }
 
-/// Returns true if english text
-pub fn is_english(text: &str) -> bool {
-    whatlang::detect(text)
-        .map(|info| info.lang() == whatlang::Lang::Eng)
-        .unwrap_or(false)
+/// Pause before retrying a failed LLM request (0.4s, 0.8s, 1.6s... up to 6.4s).
+///
+/// Used only for transport errors (rate limits, 5xx, broken streams):
+/// retrying instantly would burn all attempts within a second.
+pub async fn backoff(attempt: usize) {
+    let shift = attempt.saturating_sub(1).min(4) as u32;
+    tokio::time::sleep(std::time::Duration::from_millis(400u64 << shift)).await;
 }

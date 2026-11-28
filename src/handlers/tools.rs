@@ -76,6 +76,8 @@ pub async fn handle_tool(
 ) -> Result<(String, String)> {
     let func = tool_call.func;
     let tool_call_id = tool_call.id;
+    // a call made by the model (not a direct CLI call): its errors must reach the model
+    let by_model = !tool_call_id.is_empty();
     let log_json = func.json_str.replace('\n', " ");
 
     let msg = format!(
@@ -86,9 +88,22 @@ pub async fn handle_tool(
     tx.send(Event::Thinking(msg).into()).await.ok();
 
     let request_path = format!("/skills/{skill_name}/call/{}", func.name);
+    let payload = match func.parse_args::<JsonValue>() {
+        Ok(payload) => payload,
+        // invalid arguments are the model's mistake: tell it instead of aborting the whole skill
+        Err(e) if by_model => {
+            return Ok((
+                tool_call_id,
+                format!(
+                    "Tool error: the arguments are not valid JSON ({e}). Call the tool again with valid JSON arguments."
+                ),
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
     let request_body = ToolQuery {
         current_path,
-        payload: func.parse_args::<JsonValue>()?,
+        payload,
     };
     let mut response = client
         .post(&request_path)
@@ -134,6 +149,7 @@ pub async fn handle_tool(
     };
 
     let mut full_text = str!();
+    let mut errors: Vec<String> = vec![];
 
     while let Some(event) = tokio::select! {
         _ = tx.closed() => return Err(Error::ConnectionClosed.into()),
@@ -166,10 +182,30 @@ pub async fn handle_tool(
                         })?;
                 }
             }
+            // the model must see the agent's errors to fix the call; the user gets a status line
+            Event::Error(err) if by_model => {
+                let _ = tx
+                    .send(Event::Thinking(format!("Tool error: {err}")).into())
+                    .await;
+                errors.push(err);
+            }
             event => {
                 let _ = tx.send(event.into()).await;
             }
         }
+    }
+
+    if !errors.is_empty() {
+        if !full_text.trim().is_empty() {
+            full_text.push('\n');
+        }
+        full_text.push_str(&format!(
+            "Tool error: {}\nCheck the arguments and call the tool again, or report that it cannot be done.",
+            errors.join("; ")
+        ));
+    } else if by_model && full_text.trim().is_empty() {
+        // an empty tool result confuses some providers and the model alike
+        full_text = "Tool finished without output.".into();
     }
 
     Ok((tool_call_id, full_text))

@@ -38,12 +38,12 @@ pub fn system_prompt(info: &SessionInfo, cfg: &Config) -> String {
         )
         .replace(
             "{DATETIME_GLOBAL}",
-            &now_utc.format("%A, %B %d, %Y, %I:%M:%S %p UTC").to_string(),
+            &now_utc.format("%A, %B %d, %Y, %I:%M %p UTC").to_string(),
         )
         .replace(
             "{DATETIME_LOCAL}",
             &now_local
-                .format("%A, %B %d, %Y, %I:%M:%S %p %Z")
+                .format("%A, %B %d, %Y, %I:%M %p %Z")
                 .to_string(),
         )
 }

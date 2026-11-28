@@ -7,10 +7,11 @@ use crate::{
 };
 
 use anylm::{
-    api::{Content, Message, Messages, Tool},
+    api::{Content, Message, Messages, Tool, ToolCall},
     completions::{Chunk, Completions},
 };
 use osy_share::{Event, HandleQuery, SessionId, SessionInfo};
+use std::collections::HashMap;
 use tokio::task::JoinSet;
 
 /// API: Handles skill query.
@@ -153,37 +154,53 @@ pub async fn handle_skill(
         msgs.wrap()
     };
 
-    let mut retry_count = 0;
     let max_retries = exec_options.max_retries.max(1);
+    let max_steps = exec_options.skill_max_iterations.max(1);
+    let max_total_errors = exec_options.max_total_errors.max(max_retries);
+    let max_identical = exec_options.max_identical_calls.max(1);
 
-    let mut iteration = 0;
-    let max_iterations = exec_options.max_iterations.max(1);
+    let mut retry_count = 0; // consecutive failures (reset after every successful step)
+    let mut total_errors = 0; // all failures of this run
+    let mut steps = 0; // successful LLM steps
+    let mut final_step_announced = false;
+    let mut seen_calls: HashMap<String, usize> = HashMap::new();
 
-    // cycle of generation and self-healing
+    // cycle of generation and self-healing:
+    // * transport/LLM errors are retried with a pause (the counters protect from endless loops);
+    // * tool errors are returned to the model as results, so it fixes the call on the spot.
     loop {
         if tx.is_closed() {
             return Err(Error::ConnectionClosed.into());
         }
 
-        iteration += 1;
-        if iteration > max_iterations {
+        if steps >= max_steps {
             warn!(
-                "Agent `{agent_name}` reached maximum allowed iterations ({max_iterations}) for skill `{skill_name}`."
+                "Agent `{agent_name}` reached maximum allowed steps ({max_steps}) for skill `{skill_name}`."
             );
             return Err(Error::Custom(format!(
-                "Agent `{agent_name}` exceeded maximum execution limit of {max_iterations} iterations."
+                "Agent `{agent_name}` exceeded maximum execution limit of {max_steps} steps."
             ))
             .into());
+        }
+
+        // the last step is made without tools: the model reports what was done and what failed
+        let last_step = max_steps > 1 && steps + 1 >= max_steps;
+        if last_step && !final_step_announced {
+            final_step_announced = true;
+            agent_messages.lock().await.add_user(vec![
+                "Step limit reached. Do not call tools anymore: report the result so far and clearly state what failed or is not done.".into(),
+            ]);
         }
 
         let mut tool_calls = vec![];
         let mut text_response = str!();
 
-        match Completions::try_from(provider_options.clone())?
-            .tools(tools.clone())
-            .send(agent_messages.clone())
-            .await
-        {
+        let mut completions = Completions::try_from(provider_options.clone())?;
+        if !last_step {
+            completions = completions.tools(tools.clone());
+        }
+
+        match completions.send(agent_messages.clone()).await {
             Ok(mut stream) => {
                 let mut chunk_error = None;
 
@@ -211,7 +228,8 @@ pub async fn handle_skill(
 
                 if let Some(err) = chunk_error {
                     retry_count += 1;
-                    if retry_count < max_retries {
+                    total_errors += 1;
+                    if retry_count < max_retries && total_errors <= max_total_errors {
                         warn!(
                             "Error reading stream from agent `{agent_name}`. Retrying ({retry_count}/{max_retries}): {err}"
                         );
@@ -227,6 +245,7 @@ pub async fn handle_skill(
                             format!("An error occurred during output generation: {err}. Please try again using tools.").into()
                         ]);
 
+                        utils::backoff(retry_count).await;
                         continue;
                     } else {
                         return Err(Error::Custom(format!(
@@ -238,7 +257,8 @@ pub async fn handle_skill(
 
                 if tool_calls.is_empty() && text_response.trim().is_empty() {
                     retry_count += 1;
-                    if retry_count < max_retries {
+                    total_errors += 1;
+                    if retry_count < max_retries && total_errors <= max_total_errors {
                         warn!(
                             "Agent `{agent_name}` returned empty response and no tool calls. Retrying ({retry_count}/{max_retries})..."
                         );
@@ -265,7 +285,8 @@ pub async fn handle_skill(
             }
             Err(e) => {
                 retry_count += 1;
-                if retry_count < max_retries {
+                total_errors += 1;
+                if retry_count < max_retries && total_errors <= max_total_errors {
                     warn!(
                         "Failed to send completions request for agent `{agent_name}` ({retry_count}/{max_retries}): {e}"
                     );
@@ -280,6 +301,8 @@ pub async fn handle_skill(
                     agent_messages.lock().await.add_user(vec![
                         format!("Failed to process request due to error: {e}. Please attempt to execute the task again.").into()
                     ]);
+
+                    utils::backoff(retry_count).await;
                     continue;
                 } else {
                     return Err(Error::Custom(format!(
@@ -294,15 +317,35 @@ pub async fn handle_skill(
             return Err(Error::ConnectionClosed.into());
         }
 
-        // if no tool calls, return the final response of the skill
-        if tool_calls.is_empty() {
+        // a valid step: the consecutive failure counter starts over
+        steps += 1;
+        retry_count = 0;
+
+        // if no tool calls (or tools were not offered on the last step), return the final response of the skill
+        if tool_calls.is_empty() || last_step {
             return Ok(format!("Agent `{agent_name}` response:\n{text_response}"));
         }
 
         let mut sub_workers = JoinSet::new();
+        let mut blocked: Vec<(String, String)> = vec![];
 
         // parallel execution of sub-tool calls (handling both basic system tools and IPC tools)
         for tool_call in tool_calls {
+            // protection from endless loops: the same call with the same arguments is not executed again and again
+            let key = format!("{}:{}", tool_call.func.name, tool_call.func.json_str);
+            let times = seen_calls.entry(key).or_insert(0);
+            *times += 1;
+            if *times > max_identical {
+                blocked.push((
+                    tool_call.id.clone(),
+                    format!(
+                        "Tool error: this exact call was already made {max_identical} times. \
+                         Use the earlier results, change the arguments, or report that the task cannot be completed."
+                    ),
+                ));
+                continue;
+            }
+
             let client = client.clone();
             let sock_path = sock_path.clone();
             let agent_name = agent_name.clone();
@@ -313,51 +356,47 @@ pub async fn handle_skill(
 
             sub_workers.spawn(
                 async move {
-                    match tool_call.func.name.as_str() {
-                        "js_eval" => {
-                            let eval: EvalAction = tool_call.parse_args()?;
-                            tx.send(
-                                Event::Thinking(format!(
-                                    "Executing JavaScript code: {:80}...",
-                                    &eval.code
-                                ))
-                                .into(),
-                            )
-                            .await
-                            .ok();
-                            let result = skills::handle_eval(eval).await?;
-                            Ok((tool_call.id, format!("JS Result:\n{result}")))
-                        }
-                        "remember_fact" => {
-                            let act: RememberFact = tool_call.parse_args()?;
-                            let user = UserState::get_or_init(session_info.id.user_id).await?;
-                            let res_msg = skills::handle_remember_fact(&user, act).await?;
-                            tx.send(Event::Thinking(res_msg.clone()).into()).await.ok();
-                            Ok((tool_call.id, format!("Memory Operation Result:\n{res_msg}")))
-                        }
-                        "search_fact" => {
-                            let act: SearchFact = tool_call.parse_args()?;
-                            let user = UserState::get_or_init(session_info.id.user_id).await?;
-                            let res_msg = skills::handle_search_fact(&user, act).await?;
-                            tx.send(Event::Thinking(res_msg.clone()).into()).await.ok();
-                            Ok((tool_call.id, format!("Memory Operation Result:\n{res_msg}")))
-                        }
-                        _ => {
-                            super::handle_tool(
-                                client,
-                                sock_path,
-                                agent_name,
-                                skill_name,
-                                tool_call,
-                                current_path,
-                                tx,
-                            )
-                            .await
+                    let call_id = tool_call.id.clone();
+
+                    match run_sub_tool(
+                        client,
+                        sock_path,
+                        agent_name,
+                        skill_name,
+                        session_info,
+                        current_path,
+                        tx.clone(),
+                        tool_call,
+                    )
+                    .await
+                    {
+                        Ok(res) => Ok(res),
+                        // the client has gone: nothing to heal
+                        Err(e) if tx.is_closed() => Err(e),
+                        // otherwise the error becomes the tool result, so the model can fix the call
+                        Err(e) => {
+                            warn!("Sub-tool failed, returning the error to the model: {e}");
+                            Ok((
+                                call_id,
+                                format!(
+                                    "Tool error: {e}\nCheck the arguments and call the tool again, or report that it cannot be done."
+                                ),
+                            ))
                         }
                     }
                 }
                 .log_span(Span::current()),
             );
+        }
+
+        if !blocked.is_empty() {
+            let mut guard = agent_messages.lock().await;
+            for (tool_call_id, text) in blocked {
+                guard.push_content(
+                    Some(&tool_call_id),
+                    Content::text(format!("Tool execution result:\n{text}")),
+                );
+            }
         }
 
         // collecting results of work of the sub-tools
@@ -377,17 +416,76 @@ pub async fn handle_skill(
                             );
                         }
                         Some(Ok(Err(e))) => {
-                            error!("Sub-tool execution failed: {e}");
+                            error!("Sub-tool execution aborted: {e}");
+                            sub_workers.abort_all();
                             return Err(e);
                         }
                         Some(Err(e)) => {
                             error!("Sub-tool worker panicked: {e}");
+                            sub_workers.abort_all();
                             return Err(e.into());
                         }
                         None => break,
                     }
                 }
             }
+        }
+    }
+}
+
+/// Executes one tool call of the skill (basic runtime tools or an agent tool over IPC).
+///
+/// Errors are returned to the caller, which turns them into a tool result for the model.
+async fn run_sub_tool(
+    client: Client,
+    sock_path: String,
+    agent_name: String,
+    skill_name: String,
+    session_info: SessionInfo,
+    current_path: Option<PathBuf>,
+    tx: Sender<Bytes>,
+    tool_call: ToolCall,
+) -> Result<(String, String)> {
+    match tool_call.func.name.as_str() {
+        "js_eval" => {
+            let eval: EvalAction = tool_call.parse_args()?;
+            tx.send(
+                Event::Thinking(format!(
+                    "Executing JavaScript code: {:80}...",
+                    &eval.code
+                ))
+                .into(),
+            )
+            .await
+            .ok();
+            let result = skills::handle_eval(eval).await?;
+            Ok((tool_call.id, format!("JS Result:\n{result}")))
+        }
+        "remember_fact" => {
+            let act: RememberFact = tool_call.parse_args()?;
+            let user = UserState::get_or_init(session_info.id.user_id).await?;
+            let res = skills::handle_remember_fact(&user, act).await?;
+            tx.send(Event::Thinking(res.text.clone()).into()).await.ok();
+            Ok((tool_call.id, format!("Memory Operation Result:\n{}", res.text)))
+        }
+        "search_fact" => {
+            let act: SearchFact = tool_call.parse_args()?;
+            let user = UserState::get_or_init(session_info.id.user_id).await?;
+            let res_msg = skills::handle_search_fact(&user, act).await?;
+            tx.send(Event::Thinking(res_msg.clone()).into()).await.ok();
+            Ok((tool_call.id, format!("Memory Operation Result:\n{res_msg}")))
+        }
+        _ => {
+            super::handle_tool(
+                client,
+                sock_path,
+                agent_name,
+                skill_name,
+                tool_call,
+                current_path,
+                tx,
+            )
+            .await
         }
     }
 }
